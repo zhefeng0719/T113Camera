@@ -1,0 +1,33 @@
+# Build output
+output/
+*.o
+*.a
+*.so
+*.elf
+*.bin
+
+# Local test media
+Dat/
+
+# Runtime logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# OS / editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Large generated or transferred media
+*.img
+*.avi
+*.mp4
+*.mp3
+*.wav
+*.aac
+*.mjpeg
+*.mjpg
