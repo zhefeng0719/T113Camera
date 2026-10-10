@@ -11,6 +11,7 @@ struct video_frame {
     size_t size;                    /* 帧数据长度。 */
     unsigned int index;             /* V4L2 mmap 缓冲索引，归还缓冲时使用。 */
     unsigned int sequence;          /* 摄像头帧序号，便于观察是否连续采集。 */
+    int64_t timestamp_us;           /* V4L2 单调采集时间戳；缺失时在出队时补充。 */
 };
 
 /* V4L2 摄像头上下文。调用 open 后由模块维护，调用 close 释放。 */

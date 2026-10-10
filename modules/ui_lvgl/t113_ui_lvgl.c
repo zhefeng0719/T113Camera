@@ -9,6 +9,7 @@
  */
 
 #include "t113_ui_lvgl.h"
+#include "disp_layer_display.h"
 
 #include "custom.h"
 #include "gg_utils.h"
@@ -142,6 +143,14 @@ static int ui_alloc_dmabuf(struct t113_ui_lvgl *ui)
 
     memset(ui->virt, 0, ui->size);
     SunxiMemFlushCache(ui->memops, ui->virt, (int)ui->size);
+    for (unsigned int i = 0; i < 2; i++) {
+        ui->scan_virt[i] = SunxiMemPalloc(ui->memops, (int)ui->size);
+        if (!ui->scan_virt[i] ||
+            (ui->scan_fd[i] = SunxiMemGetBufferFd(ui->memops, ui->scan_virt[i])) < 0) {
+            t113_ui_lvgl_close(ui);
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -275,9 +284,28 @@ bool t113_ui_lvgl_get_video_rect(struct t113_ui_rect *rect)
     return true;
 }
 
-int t113_ui_lvgl_get_dmabuf_fd(const struct t113_ui_lvgl *ui)
+int t113_ui_lvgl_get_dmabuf_fd(struct t113_ui_lvgl *ui)
 {
-    return ui ? ui->dmabuf_fd : -1;
+    unsigned int back;
+    if (!ui || !ui->virt)
+        return -1;
+    back = ui->scan_back;
+    memcpy(ui->scan_virt[back], ui->virt, ui->size);
+    SunxiMemFlushCache(ui->memops, ui->scan_virt[back], (int)ui->size);
+    return ui->scan_fd[back];
+}
+
+int t113_ui_lvgl_present(struct t113_ui_lvgl *ui, struct disp_layer_display *disp)
+{
+    if (!ui || ui->present_failed)
+        return -1;
+    int ret = disp_layer_display_show_argb8888(disp, t113_ui_lvgl_get_dmabuf_fd(ui),
+                                               ui->width, ui->height);
+    if (ret == 0)
+        ui->scan_back ^= 1; /* Failed submission must not release the currently scanning buffer. */
+    else
+        ui->present_failed = 1;
+    return ret;
 }
 
 uint32_t t113_ui_lvgl_get_width(const struct t113_ui_lvgl *ui)
@@ -304,6 +332,9 @@ void t113_ui_lvgl_close(struct t113_ui_lvgl *ui)
         g_flush_target = NULL;
     if (ui->virt != NULL && ui->memops != NULL)
         SunxiMemPfree(ui->memops, ui->virt);
+    for (unsigned int i = 0; i < 2; i++)
+        if (ui->scan_virt[i] && ui->memops)
+            SunxiMemPfree(ui->memops, ui->scan_virt[i]);
     if (ui->memops != NULL)
         SunxiMemClose(ui->memops);
 

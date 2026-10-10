@@ -4,7 +4,7 @@
 #include "framebuffer_display.h"    /* framebuffer_display 结构体，保留旧 fb fallback 接口。 */
 #include "image_convert.h"          /* yuv_image 结构体。 */
 
-/* G2D 显示上下文：保存 /dev/g2d 和两块 ION 中间缓冲。 */
+/* G2D 显示上下文：一个复制回退源缓冲和两张交替输出 RGB 页。 */
 struct g2d_display {
     int fd;                         /* /dev/g2d 文件描述符。 */
     struct SunxiMemOpsS *memops;    /* libawion 内存操作接口。 */
@@ -12,6 +12,8 @@ struct g2d_display {
     void *dst_virt;                 /* 目标 ARGB8888 图像 ION 虚拟地址。 */
     int src_dmabuf_fd;              /* 源图 ION dmabuf fd。 */
     int dst_dmabuf_fd;              /* 目标图 ION dmabuf fd。 */
+    void *dst_spare; /* 另一张 RGB 输出页的映射地址，与 spare_fd 成对。 */
+    int dst_spare_fd;               /* Alternate output; never render into the scanning buffer. */
     unsigned int src_width;         /* 源图宽度。 */
     unsigned int src_height;        /* 源图高度。 */
     unsigned int src_size;          /* 源图 ION 缓冲大小。 */

@@ -41,41 +41,41 @@ int framebuffer_open(struct framebuffer_display *fb, const char *device)
 
     memset(fb, 0, sizeof(*fb));
 
-    fb->fd = open(device, O_RDWR);
+    fb->fd = open(device, O_RDWR); /* 旧 framebuffer 回退路径直接访问 /dev/fb0。 */
     if (fb->fd < 0) {
         perror(device);
         return -1;
     }
 
-    if (ioctl(fb->fd, FBIOGET_VSCREENINFO, &vinfo) < 0) {
+    if (ioctl(fb->fd, FBIOGET_VSCREENINFO, &vinfo) < 0) { /* 读取可见分辨率、虚拟高度与像素位深。 */
         perror("FBIOGET_VSCREENINFO");
         framebuffer_close(fb);
         return -1;
     }
 
-    if (ioctl(fb->fd, FBIOGET_FSCREENINFO, &finfo) < 0) {
+    if (ioctl(fb->fd, FBIOGET_FSCREENINFO, &finfo) < 0) { /* 读取驱动实际行跨度与显存容量。 */
         perror("FBIOGET_FSCREENINFO");
         framebuffer_close(fb);
         return -1;
     }
 
-    if (vinfo.bits_per_pixel != 32) {
+    if (vinfo.bits_per_pixel != 32) { /* 此回退实现按四字节 BGRA 写像素，不等同 LCD RGB666 总线。 */
         fprintf(stderr, "unsupported framebuffer bpp: %u, need 32\n",
                 vinfo.bits_per_pixel);
         framebuffer_close(fb);
         return -1;
     }
 
-    fb->width = vinfo.xres;
-    fb->height = vinfo.yres;
-    fb->virtual_height = vinfo.yres_virtual;
+    fb->width = vinfo.xres; /* 可见宽度，不是显存行跨度。 */
+    fb->height = vinfo.yres; /* 可见高度，不能把双页虚拟高度当屏幕高度。 */
+    fb->virtual_height = vinfo.yres_virtual; /* 显存虚拟高度可能包含两个显示页。 */
     fb->bpp = vinfo.bits_per_pixel;
-    fb->line_length = finfo.line_length;
-    fb->phys_addr = finfo.smem_start;
-    fb->map_size = finfo.smem_len;
+    fb->line_length = finfo.line_length; /* 每行实际字节跨度可能包含填充。 */
+    fb->phys_addr = finfo.smem_start; /* 驱动提供的物理地址只作记录，CPU 使用 mmap 虚拟地址。 */
+    fb->map_size = finfo.smem_len; /* 映射完整显存范围，释放时使用同一长度。 */
 
     fb->mem = mmap(NULL, fb->map_size, PROT_READ | PROT_WRITE,
-                   MAP_SHARED, fb->fd, 0);
+                   MAP_SHARED, fb->fd, 0); /* 映射驱动 framebuffer；写入的是共享显存。 */
     if (fb->mem == MAP_FAILED) {
         perror("mmap framebuffer");
         fb->mem = NULL;
@@ -115,9 +115,9 @@ void framebuffer_clear(struct framebuffer_display *fb, unsigned char r,
         return;
 
     for (y = 0; y < fb->height; y++) {
-        unsigned char *row = fb->mem + (size_t)y * fb->line_length;
+        unsigned char *row = fb->mem + (size_t)y * fb->line_length; /* 逐行按真实 stride 定位，不能简单用 width 乘四。 */
         for (x = 0; x < fb->width; x++)
-            put_pixel_bgra(row + x * 4, r, g, b);
+            put_pixel_bgra(row + x * 4, r, g, b); /* 按四字节像素布局清屏，此回退是 CPU 写像素。 */
     }
 }
 

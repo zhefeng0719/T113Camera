@@ -24,9 +24,12 @@ struct cedar_decoder {
 
 /* CedarC 解码后的 YUV420 半平面图像，当前主要对应 NV21/NV12。 */
 struct yuv_image {
+    int64_t pts_ms;                 /* 解码输出帧自己的 PTS，支持 B 帧重排序。 */
     unsigned int width;             /* 有效图像宽度。 */
     unsigned int height;            /* 有效图像高度。 */
     unsigned int stride;            /* Y 平面每行字节数；直通时来自 CedarC nLineStride。 */
+    unsigned int buffer_height;     /* Allocated plane height, distinct from the visible JPEG crop. */
+    unsigned int crop_x, crop_y; /* 有效图像在对齐缓冲中的左上偏移，传给 G2D 源 clip。 */
     unsigned int is_nv21;           /* 1 表示 NV21/VU 顺序，0 表示 NV12/UV 顺序。 */
     unsigned char *data;            /* 回退拷贝模式下的 YUV 数据；直通模式下指向 CedarC pData0。 */
     size_t size;                    /* YUV 数据大小。 */
@@ -56,5 +59,6 @@ int image_convert_decode_mjpeg(struct cedar_decoder *ctx,
 void image_convert_free_yuv(struct yuv_image *image);
 /* 关闭 CedarC 解码器。 */
 void image_convert_close(struct cedar_decoder *ctx);
+int image_convert_drain(struct cedar_decoder *ctx, struct yuv_image *out); /* EOF 排出重排序尾帧；1 有图、0 排空、-1 错误。 */
 
 #endif

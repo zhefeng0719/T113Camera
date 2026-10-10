@@ -1,251 +1,166 @@
 # T113Camera
 
-T113Camera 是基于全志 T113S3 开发板的嵌入式相机和媒体播放器原型。项目面向 5 寸 800x480 屏幕、UVC USB 摄像头、板载音频、U 盘存储和三按键交互，核心目标是完成一个可录制、可播放、可扩展的嵌入式音视频应用。
+全志 T113S3 相机与媒体播放器，使用 800x480 屏幕、UVC 摄像头、板载麦克风、
+耳机/外接喇叭、U 盘和三个按键，暂不使用触摸。
 
-## 功能概览
+状态：**功能验收候选版，等待用户审批**。按用户要求整理并提交 GitHub，
+未安装开机服务或修改 SDK 镜像。改动、实测数据和待验收事项见
+[验收报告](reports/2026-10-10-acceptance.md)。
+JPG 切换与审查风险的后续修复见 [修复回归](reports/2026-10-10-review-fixes.md)，
+旧验收报告中的二进制哈希属于上一版，不代表本次产物。
 
-支持 MP3/AAC/WAV 等音频播放，支持 MP4/AVI 等容器解析，支持 H264/MJPEG 硬件解码显示，支持 JPG 图片预览，支持 UVC USB 摄像头实时预览，支持 MJPEG 视频录制并封装为 AVI，支持板载音频采集与播放，支持 U 盘媒体扫描与保存，支持 LVGL 图形界面和三按键交互，支持 G2D 硬件缩放与格式转换。
+2026-10-10 清理：移除本地构建缓存、测试二进制、临时日志、测试素材副本和候选压缩包，
+保留 `output/t113_camera`、测试源码及报告；清理板卡空的应用临时目录，
+保留正式程序、独立测试工具和 U 盘媒体。构建产物与本地 `Dat/` 素材不提交。
 
-## 当前能力
+## 当前功能
 
-- 播放模式扫描 U 盘媒体目录并显示播放列表。
-- 录制模式使用 USB UVC 摄像头采集 MJPEG，并实时显示到 UI 视频区域。
-- 录制文件以 `record1.avi` 到 `record5.avi` 保存到 U 盘。
-- AVI 录制采用 MJPEG 视频流和 PCM S16_LE 音频流。
-- MP4 播放支持 H264/H265 视频流，FFmpeg 负责解封装，CedarC 负责硬解码。
-- MP3/AAC 使用 FFmpeg 解码为 PCM 后交给 ALSA 播放。
-- WAV 使用 PCM WAV 播放链路。
-- JPG/JPEG 可在视频区域预览。
-- 音频播放时，视频区域显示绿色音量条。
-- 三个实体按键用于选择、确认、返回和模式切换。
+- MP3、AAC、PCM S16_LE WAV 播放，绿色音量条、播放进度和暂停。
+- AVI/MP4/MKV 解封装；MJPEG/H264/H265 经 CedarC 硬解、G2D 缩放转换。
+- JPG/JPEG 静态预览，媒体列表与当前项高亮。
+- 摄像头实时预览，MJPEG + 48 kHz/S16_LE/mono PCM 录制，FFmpeg API 封装 AVI。
+- 拍照直接保存摄像头 JPEG 压缩帧，不二次编码。
+- U 盘热插拔监控：块设备事件 + 300ms 挂载核查，支持动态挂载路径；只读盘可播放但不可录制。
+- 自动避开同名文件与 .part，例如 record1_001.avi、record1_001.jpg。
+- 先写 .part，排尾/fsync 成功才发布；空间不足或 I/O 失败不报告保存成功。
+- 单实例锁，切换先关闭旧任务，退出清理音频、解码器及显示图层。
+- JPG 按实际尺寸独立解码，正确处理可见尺寸、stride 和 UV 平面高度。
+- 录制使用独立写入线程；队列饱和时明确失败，不堵住预览线程或静默丢帧。
+- UI 与视频采用交替显示缓冲，通过真实 VSYNC 事件等待图层提交生效。
 
-## 项目进度快照
+## 按键
 
-记录日期：2026-10-10
+| 模式 | 操作 | 行为 |
+| --- | --- | --- |
+| 播放 | NEXT / ENTER 短按 | 下一项 / 上一项；先停止旧播放 |
+| 播放 | BACK 短按 / 长按 | 播放暂停 / 停止播放后进入相机 |
+| 相机 | BACK 长按 | 收尾录像，返回播放列表 |
+| 相机 | NEXT / ENTER 短按 | 选择 record1..record5 命名基名 |
+| 相机待机 | NEXT 长按 | 拍照 / 录像切换 |
+| 相机 | BACK 短按 | 拍照，或开始 / 停止录像 |
 
-当前项目已经从单项硬件测试进入总项目整合阶段。USB 存储、UVC 摄像头、屏幕显示、G2D、CedarC、ALSA 音频、FFmpeg 解封装/封装、LVGL UI 和三按键输入都已经接入主程序。
-
-当前主程序状态：
-
-- 可启动 LVGL 播放界面，并自动清理原系统 LVGL 演示程序对屏幕的干扰。
-- 可扫描 U 盘 `/mnt/usb/sda/T113Camera` 下的音频、图片和视频文件。
-- 可播放 MP3/AAC/WAV 音频，播放时视频区域显示绿色音量条。
-- 可预览 JPG/JPEG 图片。
-- 可播放 MP4/AVI 等视频文件，其中 H264/H265/MJPEG 走 CedarC 硬解显示链路。
-- 可长按进入录制模式，显示 USB 摄像头实时画面。
-- 可选择 `record1` 到 `record5` 作为录制文件名，并保存为 AVI。
-- 录制 AVI 当前采用 MJPEG 视频 + PCM S16_LE 音频。
-
-预优化状态中暴露过的问题：
-
-- 早期录制只保存 MJPEG 裸流，没有容器时间戳，播放时会出现速度过快、时长不准。
-- 早期视频显示存在 CPU 缩放、G2D 黑屏、NV12/NV21 色彩异常等问题。
-- 早期录制和播放切换时资源释放顺序不稳定，刚录完 AVI 后切换播放列表可能导致板端卡死。
-- 早期 LVGL 和视频层刷新互相覆盖，录制模式 UI 有时被视频层盖住。
-- 早期音频录制使用错误 ADC 通道或过高增益时，出现尖声、底噪大、播放速度异常。
-
-已经完成的优化：
-
-- 视频显示主链路收敛为 CedarC 硬解 + G2D 缩放/格式转换 + `/dev/disp` 图层显示。
-- 默认使用已验证正常的 NV12/NV21 显示路径，避免红蓝错位和灰度异常。
-- 录制增加 FFmpeg AVI muxer，解决裸 MJPEG 播放时长和帧率不可控的问题。
-- 播放增加 FFmpeg demuxer/audio decoder，支持更多容器和音频格式。
-- 显示、解码、G2D、disp 释放顺序已经收敛，降低模式切换时的资源竞争。
-- 容器视频自动首帧预览暂时关闭，避免刚录制完成后马上预览触发卡死。
-- 音频采集确认 ADC1 链路较稳定，采样率保持 48 kHz，增益降低后底噪明显下降。
-- 代码按 audio、video、display、storage、media、input、ui_lvgl 模块拆分，主函数负责状态调度。
-
-仍需继续优化：
-
-- 播放帧率应进一步使用容器真实时间戳调度，而不是只依赖固定帧率估算。
-- 录制时音视频同步仍需长期测试，后续可加入时间戳队列和丢帧策略。
-- AVI/MP4 首帧预览需要改为异步、可取消、限频实现。
-- 音频采集仍需继续优化增益、底噪、滤波和自动增益策略。
-- 录制文件需要增加剩余空间检测、文件存在提示、覆盖保护或自动递增。
-- UI 状态机还可以继续收束，减少播放、录制、预览之间的隐式状态耦合。
-
-## 技术栈
-
-- SoC：Allwinner T113S3
-- 系统：Tina / Buildroot Linux
-- 语言：C
-- UI：LVGL 9 + NXP GUI Guider
-- 显示：`/dev/disp` 图层
-- 视频采集：V4L2 / UVC / MJPEG
-- 视频解码：CedarC 硬件解码
-- 图像处理：G2D 缩放和 YUV 到 ARGB8888 转换
-- 音频：ALSA `hw:0,0`
-- 容器和音频编解码：FFmpeg API
-- 存储：U 盘 `/mnt/usb/sda/T113Camera`
-
-## 目录结构
-
-```text
-src/
-  main.c                    程序入口、模式切换、按键调度和主流程
-
-modules/audio/
-  audio_alsa.*              ALSA 播放/采集基础封装
-  audio_capture.*           录制音频采集线程
-  ffmpeg_audio_player.*     MP3/AAC 等音频解码播放
-  wav_player.*              WAV 播放
-
-modules/video/
-  video_capture.*           V4L2 UVC 摄像头采集
-  image_convert.*           CedarC 解码封装
-
-modules/display/
-  disp_layer_display.*      /dev/disp 图层显示
-  g2d_display.*             G2D 缩放和格式转换
-  framebuffer_display.*     framebuffer fallback
-
-modules/storage/
-  ffmpeg_mjpeg_muxer.*      AVI 封装
-  ffmpeg_mjpeg_demuxer.*    AVI/MP4/MKV 解封装视频 packet
-  ffmpeg_pcm_demuxer.*      PCM 音频解封装
-  mjpeg_save.*              MJPEG 裸流保存工具
-
-modules/media/
-  media_list.*              U 盘媒体扫描和文件类型识别
-
-modules/input/
-  input_key.*               三按键输入
-
-modules/ui_lvgl/
-  t113_ui_lvgl.*            LVGL 到 disp 图层的适配
-
-ui/
-  GUI Guider 生成代码和 LVGL 依赖
-```
-
-## 媒体目录
-
-板端 U 盘目录约定如下：
-
-```text
-/mnt/usb/sda/T113Camera/
-  AUDIO/                    MP3 / AAC / WAV
-  DCIM/                     JPG / JPEG
-  VIDEO/                    AVI / MP4 / MJPEG
-```
-
-`Dat/` 目录只作为本地测试素材暂存目录，不建议提交到 GitHub。
+长按阈值 1.5 秒；录像中不能换名字或类型。Ctrl+C/SIGTERM 正常收尾。
+强制复位、SIGKILL、突然掉电及拔盘不能保证当前文件完整。
 
 ## 数据链路
 
-录制链路：
+### 源码阅读
+
+业务源码和头文件已补充中文行内注释，重点说明数据单位、缓冲区所有权、
+采集时间戳、音频主时钟、队列同步及失败收尾。多行调用按完整语句阅读，
+空行、大括号和自明的日志不重复解释。LVGL 适配层、GUI Guider 生成代码
+和第三方源码不在本轮注释范围内。建议从 `src/main.c` 的录制启动、逐帧处理、
+停止收尾，再进入 `audio_capture`、`record_writer`、`ffmpeg_mjpeg_muxer` 阅读。
+本轮仅修改注释，验证记录见 [注释核查](reports/2026-10-10-source-comments.md)。
 
 ```text
-UVC 摄像头
--> V4L2 MJPEG
--> CedarC 解码
--> G2D 缩放/转换
--> /dev/disp 显示
-
-MJPEG packet
--> FFmpeg AVI muxer
--> U 盘 VIDEO/recordN.avi
-
-板载麦克风
--> ALSA PCM S16_LE
--> FFmpeg AVI muxer
+录制：V4L2 MJPEG + ALSA PCM 队列 -> FFmpeg AVI muxer -> U 盘
+预览：MJPEG -> CedarC -> NV12/NV21 dmabuf -> G2D -> disp 视频层
+播放：文件 -> FFmpeg demux -> CedarC -> G2D -> disp
+      音轨 -> FFmpeg decoder / swresample -> ALSA
+界面：LVGL 9 + GUI Guider -> 独立 disp UI 层
+拍照：V4L2 JPEG 帧 -> 原始 JPEG 文件 -> DCIM
 ```
 
-播放链路：
+录制视频 PTS 来自采集时间，音频来自累计样本数，共用单调时钟起点。
+主线程负责视频采集/预览，音频线程负责 PCM 采集，写入线程独占 AVI 封装器。
+视频队列最多 8 帧、每帧最多 512 KiB，PCM 队列最多 64 个 block；
+长期写入过慢会停止本次录制并保留 .part，而不是增长内存或伪报保存成功。
+播放以 ALSA 实际消费进度为主时钟，视频按解码输出 PTS 显示；
+落后超过 100 ms 丢弃旧画面，不跳过参考帧解码。暂停保存待播 PCM、
+冻结时钟并在恢复后重放，避开本板硬件 pause 恢复的进度前跳。
+播放处理逐帧音频 PTS：空洞补静音、重叠跳过，超过 10 秒的跳变明确报错。
+FFmpeg 输入增加停止回调和每次 I/O 的 5 秒截止时间，但不能打断内核阻塞的系统调用。
+
+## 目录与编译
 
 ```text
-U 盘媒体文件
--> FFmpeg demux
--> MJPEG/H264/H265 packet
--> CedarC 硬解
--> G2D 缩放/转换
--> /dev/disp 显示
-
-MP3/AAC/WAV
--> FFmpeg 或 WAV parser
--> PCM S16_LE
--> ALSA 播放
+src/main.c          模式、按键、播放与录制调度
+modules/audio       ALSA、PCM 采集、FFmpeg 音频播放
+modules/video       V4L2、CedarC
+modules/display     G2D、disp、framebuffer 基础工具
+modules/storage     AVI、命名、JPEG 保存
+modules/common      时钟与队列
+modules/media       媒体扫描（非递归、最多 64 项、固定排序）
+modules/input       input_event 三按键
+modules/ui_lvgl     LVGL 显示适配
+ui                  GUI Guider 生成代码与 LVGL
+tests               存储、封装故障注入、播放时钟回归
+tools               FFmpeg 构建与可选启动脚本
+reports             验收报告
+output              编译产物（不提交 Git）
 ```
 
-## 按键交互
+### U 盘热插拔与模块边界
 
-播放模式：
+`modules/storage/storage_monitor.c/.h` 独立检测 `/mnt/usb/` 下的 sd 块设备挂载，
+同时核查 sysfs、设备号和 mount ID；不执行挂载，不依赖 LVGL、ALSA 或 CedarC。
+系统先自动挂载，应用再使用实际路径。多卷时固定选择挂载目录字典序第一卷。
 
 ```text
-NEXT  短按：下一项
-ENTER 短按：上一项
-BACK  短按：播放/暂停
-BACK  长按：进入录制模式
+内核块设备事件 / 定时核查 -> 存储快照 + generation + 粘滞 cancel
+主控制器 sync_storage_ui -> 旧任务收尾 -> 确认新会话 -> 清屏 / 重扫列表
+播放模块 -> 通用 stop -> 取消 FFmpeg 读取 / ALSA 播放 -> join
+录制模块 -> 通用 cancel -> 写线程失败 -> 不发布 AVI，保留 .part
+LVGL 适配 -> 仅显示主线程提供的状态，不检测 U 盘或操作封装器
 ```
 
-录制模式：
+拔盘、换盘、重新挂载或只读属性变化均使旧会话失效；重新插入不会自动恢复
+旧音频、旧录像或旧列表下标。监控通过锁保护任务停止指针，任务返回前必须解绑。
+JPEG 写入及 AVI 写入/发布均检查取消信号，避免旧任务写到新会话。
+这不是突然拔盘的完整性保证：内核阻塞 I/O 不能强制打断，FAT 也可能损坏。
+当前没有 UI“安全弹出”操作；需要先停止录制，再 `sync` 并卸载实际挂载点后拔出。
 
-```text
-BACK  长按：返回播放模式
-BACK  短按：开始/停止录制
-NEXT  短按：选择下一个录制文件名
-ENTER 短按：选择上一个录制文件名
-```
+编译回归：`make hotplug-test storage-test integrity-test media-regression-test`。
+板端回归脚本为 `tests/run_hotplug_board.py`，需要显式设置 `T113_BOARD_PASSWORD`；
+它会临时卸载/挂载 U 盘，不能在用户正在播放或录制时运行。
+测试证据在 `output/hotplug-logs/`，详细结果与未验收边界见
+[热插拔报告](reports/2026-10-10-usb-hotplug.md)。
 
-## 编译
-
-在 Ubuntu 虚拟机中编译：
+Ubuntu 中编译；FFmpeg 缺失时先准备 4.4.4 源码，再执行构建脚本：
 
 ```sh
 cd /mnt/hgfs/QZ-T113S/Project/T113Camera
-make
+# sh tools/build_ffmpeg.sh
+make -j4
+make storage-test integrity-test playback-timing-test
+make media-regression-test
 ```
 
-输出文件：
+依赖 Tina SDK sysroot 的 ALSA、CedarC 和 ION 库，FFmpeg 静态链接。
+最小 FFmpeg 包含 WAV/AVI/MOV/MKV 等 demuxer、PCM/MP3/AAC decoder、
+AVI muxer 与 H264/HEVC Annex-B filter；配置见 tools/build_ffmpeg.sh。
 
-```text
-output/t113_camera
-```
-
-## 上传和运行
-
-从 Windows 上传到板卡：
+Windows 上传，板端仅需应用可执行文件：
 
 ```powershell
-scp E:\QZ-T113S\Project\T113Camera\output\t113_camera root@192.168.1.77:/root/Project/T113Camera/t113_camera
+scp E:\QZ-T113S\Project\T113Camera\output\t113_camera root@192.168.1.77:/root/Project/T113Camera/
 ```
-
-在板卡运行：
 
 ```sh
 cd /root/Project/T113Camera
 chmod +x t113_camera
 ./t113_camera
-```
-
-指定文件播放测试：
-
-```sh
+./t113_camera 5  # 初始化后定时 5 秒带音频录制，同时预览
 ./t113_camera ui /mnt/usb/sda/T113Camera/VIDEO/guimie.mp4
-./t113_camera ui /mnt/usb/sda/T113Camera/AUDIO/Abdulla.mp3
-./t113_camera ui /mnt/usb/sda/T113Camera/DCIM/yln.jpg
+AV_TIMING=1 ./t113_camera ui /mnt/usb/sda/T113Camera/VIDEO/record3.avi
+T113_MIC_GAIN=8 T113_ADC_VOLUME=120 ./t113_camera
 ```
 
-命令行录制测试：
+录制默认恢复已验证的 MIC1=8、ADC1=120，不改变耳机/喇叭自动路由或放大播放音量。
+增益环境变量须为合法整数且在实际 mixer 范围内。
+U 盘固定 /mnt/usb/sda/T113Camera/{VIDEO,AUDIO,DCIM}，设备固定
+/dev/video0、/dev/input/event1、hw:0,0；换镜像需重新核对。
 
-```sh
-./t113_camera 5
-```
+## 验收边界
 
-## 当前限制
-
-- 容器视频首帧自动预览已暂时关闭，避免刚录制完成后切换 AVI 时触发 CedarC/G2D/disp 资源竞争。
-- 录制采用 MJPEG + PCM AVI，文件体积较大，但链路简单、适合当前硬件。
-- MP4/H264 播放已接入硬解，但帧率调度仍需继续优化为读取真实容器帧率。
-- 麦克风录音质量仍有优化空间，包括增益、底噪和滤波。
-- 当前交互基于三按键，暂不使用触摸。
-
-## 后续计划
-
-- 将播放、录制、UI 刷新整理成更清晰的状态机。
-- 为 AVI/MP4 首帧预览设计异步、可取消、限频版本。
-- 增加录制剩余空间检测和文件名自动递增。
-- 完善音视频同步和真实帧率调度。
-- 增加拍照模式，保存 JPG 到 `DCIM/`。
-- 增加音量控制、录音增益配置和简单降噪。
-- 增加开机自启动脚本和发布版镜像配置。
+- 容器首帧自动预览继续禁用，避免重启此前导致切换卡死的路径。
+- 实际音质、外放、屏幕显示范围与物理口型同步仍需用户验收。
+- H265 仅验证 640x480 Main/8-bit 素材，不承诺所有 profile、10-bit 或 4K。
+- JPG/裸 MJPEG 整文件读取限制 16 MiB，大视频应使用容器。
+- 文件 seek 为 64 位；真实写满、超过 2 GiB/接近 FAT32 4 GiB 上限、
+  多小时录制和拔盘故障仍未实测，不能据此宣称量产可靠。
+- 暂无自动降噪/AGC、音量 UI、掉电修复或后台自动恢复。
+- 显示同步依赖 Tina 内核 DISP_VSYNC_EVENT_EN/VSYNC0 uevent；本 SDK 的
+  FBIO_WAITFORVSYNC 未实现，不能作为缓冲复用的同步依据。
+- tools/start_camera.sh 仅为可选前台入口，审批前不安装开机启动。

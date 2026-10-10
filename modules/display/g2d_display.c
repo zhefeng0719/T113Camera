@@ -182,9 +182,10 @@ int g2d_display_open_sized(struct g2d_display *g2d,
     g2d->fd = -1;                   /* 初始化为无效 fd。 */
     g2d->src_dmabuf_fd = -1;        /* 初始化为无效 dmabuf fd。 */
     g2d->dst_dmabuf_fd = -1;        /* 初始化为无效 dmabuf fd。 */
+    g2d->dst_spare_fd = -1; /* 第二输出页尚未分配；此处不能默认使用 fd 0。 */
     g2d->src_width = src_width;     /* 保存源图宽度。 */
     g2d->src_height = src_height;   /* 保存源图高度。 */
-    g2d->src_size = src_width * src_height * 3U / 2U; /* YUV420 源缓冲大小。 */
+    g2d->src_size = ((src_width + 15U) & ~15U) * ((src_height + 15U) & ~15U) * 3U / 2U; /* 复制回退源按 16 像素对齐，为解码平面填充预留空间。 */
     g2d->dst_width = dst_width;     /* 目标输出宽度。 */
     g2d->dst_height = dst_height;   /* 目标输出高度。 */
     g2d->dst_stride = g2d->dst_width * 4U; /* ARGB8888 每行字节数。 */
@@ -236,6 +237,12 @@ int g2d_display_open_sized(struct g2d_display *g2d,
         g2d_display_close(g2d);      /* 释放已打开资源。 */
         return -1;                   /* 返回失败。 */
     }
+    g2d->dst_spare = SunxiMemPalloc(g2d->memops, (int)g2d->dst_size); /* 分配第二张输出页，G2D 不覆盖 disp 正在扫描的页面。 */
+    if (!g2d->dst_spare ||
+        (g2d->dst_spare_fd = SunxiMemGetBufferFd(g2d->memops, g2d->dst_spare)) < 0) { /* 取得备页的 dmabuf fd，失败时回收所有已分配资源。 */
+        g2d_display_close(g2d);
+        return -1;
+    }
 
     printf("g2d         : src=%ux%u YUV420 fd=%d bytes=%u\n",
            g2d->src_width, g2d->src_height,
@@ -261,6 +268,10 @@ void g2d_display_close(struct g2d_display *g2d)
         SunxiMemPfree(g2d->memops, g2d->dst_virt); /* 释放目标缓冲。 */
         g2d->dst_virt = NULL;        /* 清空指针。 */
     }
+    if (g2d->dst_spare && g2d->memops) {
+        SunxiMemPfree(g2d->memops, g2d->dst_spare); /* 显示图层已停用后释放第二输出页。 */
+        g2d->dst_spare = NULL;
+    }
 
     if (g2d->memops) {               /* 如果 ION 内存系统已打开。 */
         SunxiMemClose(g2d->memops);  /* 关闭 ION 内存系统。 */
@@ -285,6 +296,14 @@ int g2d_display_stretch_yuv_to_dmabuf(struct g2d_display *g2d,
 
     if (!g2d || !image || !g2d->dst_virt || !image->data)
         return -1;                   /* 任一关键指针无效就失败。 */
+    {
+        void *virt = g2d->dst_virt; /* 暂存上一输出页的 CPU 映射地址。 */
+        int fd = g2d->dst_dmabuf_fd; /* 同时保存对应 fd，虚拟地址和 fd 必须成对交换。 */
+        g2d->dst_virt = g2d->dst_spare; /* 本次 G2D 写入另一页，不改写当前扫描页。 */
+        g2d->dst_dmabuf_fd = g2d->dst_spare_fd; /* 选择本次输出页的 dmabuf。 */
+        g2d->dst_spare = virt; /* 旧输出页成为下一次备页，依赖上层等到真实 VSYNC 后才复用。 */
+        g2d->dst_spare_fd = fd; /* 保持备页地址与 fd 一致。 */
+    }
 
     if (image->dmabuf_fd >= 0) {     /* CedarC 已经提供可直接给 G2D 的 fd。 */
         src_fd = image->dmabuf_fd;   /* 直接使用 CedarC 输出 buffer。 */
@@ -308,12 +327,12 @@ int g2d_display_stretch_yuv_to_dmabuf(struct g2d_display *g2d,
 
     blt.src_image_h.bbuff = 1;       /* 按 SDK sample 填 1。 */
     blt.src_image_h.format = src_is_nv21 ? /* 根据实际 UV 顺序选择 G2D 格式。 */
-        G2D_FORMAT_YUV420UVC_V1U1V0U0 :
-        G2D_FORMAT_YUV420UVC_U1V1U0V0;
+        G2D_FORMAT_YUV420UVC_V1U1V0U0 : /* NV21 按 VU 顺序解释色度。 */
+        G2D_FORMAT_YUV420UVC_U1V1U0V0; /* NV12 按 UV 顺序解释色度；错误选择会使颜色交换。 */
     blt.src_image_h.width = image->stride;     /* 源缓冲宽度，直通时可能大于有效宽度。 */
-    blt.src_image_h.height = image->height;    /* 源图高度。 */
-    blt.src_image_h.clip_rect.x = 0;           /* 从源图左上角开始。 */
-    blt.src_image_h.clip_rect.y = 0;           /* 从源图左上角开始。 */
+    blt.src_image_h.height = image->buffer_height ? image->buffer_height : image->height; /* 按分配高度定位色度平面，不能仅填有效显示高度。 */
+    blt.src_image_h.clip_rect.x = image->crop_x; /* 源图有效区域横向偏移，排除解码填充。 */
+    blt.src_image_h.clip_rect.y = image->crop_y; /* 源图有效区域纵向偏移。 */
     blt.src_image_h.clip_rect.w = image->width;/* 使用完整源图宽度。 */
     blt.src_image_h.clip_rect.h = image->height;/* 使用完整源图高度。 */
     blt.src_image_h.mode = G2D_PIXEL_ALPHA;    /* 默认 alpha 模式。 */

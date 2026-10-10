@@ -4,10 +4,11 @@
 /* /dev/disp 图层显示上下文。 */
 struct disp_layer_display {
     int fd;                         /* /dev/disp 文件描述符。 */
+    int vsync_fd;                   /* Kernel uevent socket, not the SDK's no-op framebuffer ioctl. */
     unsigned int screen_width;      /* 屏幕显示宽度。 */
     unsigned int screen_height;     /* 屏幕显示高度。 */
-    unsigned int channel;           /* disp 通道号，LCD 通常使用 0。 */
-    unsigned int layer_id;          /* 图层号，当前使用 0。 */
+    unsigned int channel;           /* 显示引擎图层通道，与 ioctl 的屏幕编号 0 不同。 */
+    unsigned int layer_id;          /* 通道内图层号；UI 和视频使用各自的图层。 */
     unsigned int zorder;            /* 图层叠放顺序，数值越大越靠上。 */
     int window_x;                   /* 图层显示窗口左上角 x。 */
     int window_y;                   /* 图层显示窗口左上角 y。 */

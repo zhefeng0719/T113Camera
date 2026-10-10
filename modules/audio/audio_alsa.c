@@ -47,34 +47,34 @@ static int setup_hw_params(struct audio_pcm *pcm,
         goto fail;
     }
 
-    rc = snd_pcm_hw_params_set_access(pcm->handle, params,
-                                      SND_PCM_ACCESS_RW_INTERLEAVED);
+    rc = snd_pcm_hw_params_set_access(pcm->handle, params, /* 指定交错样本布局，各声道同一时刻样本组成一帧。 */
+                                      SND_PCM_ACCESS_RW_INTERLEAVED); /* readi/writei 使用交错 PCM 缓冲而不是声道指针数组。 */
     if (rc < 0) {                  /* interleaved 表示多声道样本按帧交错排列。 */
         fprintf(stderr, "set access failed: %s\n", snd_strerror(rc));
         goto fail;
     }
 
-    rc = snd_pcm_hw_params_set_format(pcm->handle, params,
-                                      SND_PCM_FORMAT_S16_LE);
+    rc = snd_pcm_hw_params_set_format(pcm->handle, params, /* 设置 PCM 样本数值格式，与 WAV 或 AVI 容器格式不同。 */
+                                      SND_PCM_FORMAT_S16_LE); /* 有符号 16 位小端，每个声道样本占两字节。 */
     if (rc < 0) {                  /* 当前项目统一使用 16-bit 小端 PCM。 */
         fprintf(stderr, "set S16_LE failed: %s\n", snd_strerror(rc));
         goto fail;
     }
 
-    rc = snd_pcm_hw_params_set_channels(pcm->handle, params, channels);
+    rc = snd_pcm_hw_params_set_channels(pcm->handle, params, channels); /* 声道数决定完整 PCM 帧的宽度。 */
     if (rc < 0) {                  /* 当前基准是 mono，所以 channels=1。 */
         fprintf(stderr, "set channels %u failed: %s\n", channels, snd_strerror(rc));
         goto fail;
     }
 
-    rc = snd_pcm_hw_params_set_rate_near(pcm->handle, params,
+    rc = snd_pcm_hw_params_set_rate_near(pcm->handle, params, /* 驱动可选择最接近的采样率，调用后必须检查实际值。 */
                                          &actual_rate, NULL);
     if (rc < 0) {                  /* 请求 48000，驱动返回实际可用采样率。 */
         fprintf(stderr, "set rate %u failed: %s\n", rate, snd_strerror(rc));
         goto fail;
     }
 
-    rc = snd_pcm_hw_params_set_period_size_near(pcm->handle, params,
+    rc = snd_pcm_hw_params_set_period_size_near(pcm->handle, params, /* 设置建议读写批次粒度，驱动可能调整 period。 */
                                                 &actual_period, NULL);
     if (rc < 0) {                  /* period 决定一次读写多少帧。 */
         fprintf(stderr, "set period failed: %s\n", snd_strerror(rc));
@@ -119,7 +119,7 @@ snd_pcm_sframes_t audio_capture_read(struct audio_pcm *pcm, void *buffer,
                                      snd_pcm_uframes_t frames)
 {
     while (1) {                                 /* overrun 时会重试。 */
-        snd_pcm_sframes_t got = snd_pcm_readi(pcm->handle, buffer, frames);
+        snd_pcm_sframes_t got = snd_pcm_readi(pcm->handle, buffer, frames); /* 按帧读取，正数是成功帧数，负数是 ALSA 错误码。 */
 
         if (got == -EPIPE) {                   /* 录音 overrun。 */
             fprintf(stderr, "capture overrun, prepare again\n");
@@ -156,11 +156,11 @@ int audio_playback_write(struct audio_pcm *pcm, const void *buffer,
     const char *bytes = (const char *)buffer;  /* 按字节移动指针。 */
     snd_pcm_uframes_t offset = 0;              /* 已经写入多少帧。 */
 
-    while (offset < frames) {
+    while (offset < frames) { /* 短写时继续提交余下帧，不能丢掉尾部样本。 */
         snd_pcm_sframes_t written = snd_pcm_writei(
             pcm->handle,
-            bytes + offset * frame_bytes,
-            frames - offset);
+            bytes + offset * frame_bytes, /* 将帧偏移换算成字节地址，包含全部声道。 */
+            frames - offset); /* 只提交尚未写入的完整帧。 */
 
         if (written == -EPIPE) {               /* 播放 underrun。 */
             fprintf(stderr, "playback underrun, prepare again\n");
@@ -185,7 +185,7 @@ int audio_playback_write(struct audio_pcm *pcm, const void *buffer,
 void audio_playback_drain(struct audio_pcm *pcm)
 {
     if (pcm && pcm->handle) {                  /* 句柄有效才 drain。 */
-        snd_pcm_drain(pcm->handle);
+        snd_pcm_drain(pcm->handle); /* 等待硬件消费完已提交样本，与立即丢弃的 drop 不同。 */
     }
 }
 
@@ -196,7 +196,7 @@ void audio_pcm_close(struct audio_pcm *pcm)
         return;
     }
     if (pcm->handle) {                         /* 句柄存在才关闭。 */
-        snd_pcm_close(pcm->handle);
+        snd_pcm_close(pcm->handle); /* 关闭 ALSA PCM 句柄并释放内核流资源。 */
     }
     memset(pcm, 0, sizeof(*pcm));              /* 清空结构体，避免误用旧句柄。 */
 }

@@ -100,7 +100,7 @@ int playback_queue_push(struct playback_packet_queue *queue,
                         struct playback_packet *packet)
 {
     pthread_mutex_lock(&queue->mutex); /* 加锁保护环形队列。 */
-    while (!queue->stopped && queue->count == PLAYBACK_QUEUE_CAPACITY)
+    while (!queue->stopped && queue->count == PLAYBACK_QUEUE_CAPACITY) /* 有界队列满时阻塞生产者，避免解封装无限读入内存。 */
         pthread_cond_wait(&queue->not_full, &queue->mutex); /* 队满时等待空位。 */
 
     if (queue->stopped) {           /* 队列已经停止。 */
@@ -116,12 +116,32 @@ int playback_queue_push(struct playback_packet_queue *queue,
     return 0;                       /* 入队成功。 */
 }
 
-/* 从播放队列读出一个 packet；返回 0 表示结束，1 表示拿到 packet。 */
+/* 非阻塞取包：1 有数据，0 暂时为空，-1 停止或生产结束。 */
+int playback_queue_try_pop(struct playback_packet_queue *queue,
+                           struct playback_packet **packet)
+{
+    int ret;
+    pthread_mutex_lock(&queue->mutex); /* 队列槽位、索引和结束状态由同一锁保护。 */
+    *packet = NULL;
+    if (queue->stopped || queue->count == 0) { /* 非阻塞消费没有数据时区分暂空与已终止。 */
+        ret = queue->stopped || queue->finished ? -1 : 0; /* -1 表示结束，0 表示暂空但生产者仍可能送包。 */
+    } else {
+        *packet = queue->items[queue->head];
+        queue->items[queue->head] = NULL; /* 转移 packet 所有权后清空槽，避免销毁时重复释放。 */
+        queue->head = (queue->head + 1U) % PLAYBACK_QUEUE_CAPACITY; /* 环形读索引向前推进。 */
+        queue->count--; /* 锁内减少排队包数。 */
+        pthread_cond_signal(&queue->not_full); /* 唤醒因队列满而等待的解封装线程。 */
+        ret = 1;
+    }
+    pthread_mutex_unlock(&queue->mutex); /* 取出描述符后释放锁，解码和显示在锁外执行。 */
+    return ret;
+}
+
 int playback_queue_pop(struct playback_packet_queue *queue,
                        struct playback_packet **packet)
 {
     pthread_mutex_lock(&queue->mutex); /* 加锁保护环形队列。 */
-    while (!queue->stopped && !queue->finished && queue->count == 0)
+    while (!queue->stopped && !queue->finished && queue->count == 0) /* 阻塞读取等待数据，EOF 或停止都会唤醒退出。 */
         pthread_cond_wait(&queue->not_empty, &queue->mutex); /* 队空时等待数据。 */
 
     if (queue->count == 0) {        /* 队列没有可消费数据。 */

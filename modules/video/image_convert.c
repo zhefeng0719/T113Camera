@@ -59,33 +59,49 @@ static int copy_nv12_or_nv21(const VideoPicture *pic, struct yuv_image *out,
     unsigned int stride = pic->nLineStride > 0 ?          /* CedarC 输出 stride。 */
                           (unsigned int)pic->nLineStride : width;
     unsigned char *src_y = (unsigned char *)pic->pData0;  /* CedarC Y 平面起点。 */
-    unsigned char *src_uv = src_y + stride * height;      /* CedarC UV/VU 平面起点。 */
+    unsigned char *src_uv = pic->pData1 ? (unsigned char *)pic->pData1 :
+                            src_y + stride * height;
     unsigned char *dst_uv;                                /* 输出 UV/VU 平面起点。 */
+    unsigned int crop_x = 0, crop_y = 0; /* 有效图像可能只占解码器对齐缓冲的一部分。 */
+    unsigned int dst_stride, dst_height;
+    if (pic->nLeftOffset >= 0 && pic->nRightOffset > pic->nLeftOffset && /* 裁剪边界必须有正宽度且在解码缓冲范围内。 */
+        pic->nRightOffset <= pic->nWidth) {
+        crop_x = pic->nLeftOffset; /* 复制路径从有效图像左边界开始。 */
+        width = pic->nRightOffset - pic->nLeftOffset; /* 有效宽度不等于硬件分配宽度。 */
+    }
+    if (pic->nTopOffset >= 0 && pic->nBottomOffset > pic->nTopOffset && /* 裁剪边界必须有正高度且在解码缓冲范围内。 */
+        pic->nBottomOffset <= pic->nHeight) {
+        crop_y = pic->nTopOffset; /* 跳过顶部填充行。 */
+        height = pic->nBottomOffset - pic->nTopOffset; /* 有效高度从 CedarC 裁剪边界计算。 */
+    }
+    dst_stride = (width + 1U) & ~1U; /* 半平面 4:2:0 的 UV 成对排列，奇数宽度补齐为偶数。 */
+    dst_height = (height + 1U) & ~1U; /* 奇数高度补齐，保证 UV 平面具有完整行。 */
 
     memset(out, 0, sizeof(*out));    /* 清空输出结构。 */
     out->width = width;              /* 保存有效宽度。 */
     out->height = height;            /* 保存有效高度。 */
-    out->stride = width;             /* 回退路径整理成紧凑排列。 */
+    out->stride = dst_stride; /* 保存真实分配行宽，G2D 用它定位 YUV 平面。 */
+    out->buffer_height = dst_height; /* 记录对齐后的 Y 平面高度，不能用有效高度计算 UV 起点。 */
     out->is_nv21 = is_nv21 ? 1U : 0U;/* 保存 UV 顺序。 */
     out->dmabuf_fd = -1;             /* 回退路径没有可用 dmabuf fd。 */
     out->direct = 0;                 /* 回退路径不是 CedarC 直通帧。 */
-    out->size = (size_t)width * height * 3U / 2U; /* YUV420 紧凑大小。 */
-    out->data = malloc(out->size);   /* 分配普通内存。 */
+    out->size = (size_t)dst_stride * dst_height * 3U / 2U; /* NV12/NV21 总大小为对齐 Y 平面的 1.5 倍。 */
+    out->data = calloc(1, out->size); /* Initialize padding for odd-sized JPEGs. */
     if (!out->data) {                /* 分配失败。 */
         perror("malloc yuv");        /* 打印错误。 */
         return -1;                   /* 返回失败。 */
     }
 
     for (y = 0; y < height; y++)     /* 逐行拷贝 Y 平面。 */
-        memcpy(out->data + (size_t)y * width,
-               src_y + (size_t)y * stride,
+        memcpy(out->data + (size_t)y * dst_stride, /* 复制有效 Y 行，目标使用自己的偶数 stride。 */
+               src_y + (size_t)(y + crop_y) * stride + crop_x,
                width);
 
-    dst_uv = out->data + (size_t)width * height; /* UV/VU 紧跟 Y 后。 */
-    for (y = 0; y < height / 2; y++) /* 逐行拷贝 UV/VU 平面。 */
-        memcpy(dst_uv + (size_t)y * width,
-               src_uv + (size_t)y * stride,
-               width);
+    dst_uv = out->data + (size_t)dst_stride * dst_height; /* UV/VU 起点位于完整对齐 Y 平面之后。 */
+    for (y = 0; y < dst_height / 2; y++) /* 4:2:0 色度平面高度是对齐亮度平面的一半。 */
+        memcpy(dst_uv + (size_t)y * dst_stride, /* 逐行复制交错 UV/VU，不拆开色度对。 */
+               src_uv + (size_t)(y + crop_y / 2) * stride + (crop_x & ~1U), /* 色度行数减半且横坐标成对对齐。 */
+               dst_stride);
 
     return 0;                        /* 拷贝成功。 */
 }
@@ -102,9 +118,27 @@ static int wrap_direct_picture(struct cedar_decoder *ctx, VideoPicture *pic,
     out->width = (unsigned int)pic->nWidth;     /* 有效图像宽度。 */
     out->height = (unsigned int)pic->nHeight;   /* 有效图像高度。 */
     out->stride = stride;            /* 直通时保留 CedarC stride。 */
+    out->buffer_height = (unsigned int)pic->nHeight; /* 默认缓冲高度；可通过两平面地址间距校正。 */
+    /* G2D computes its UV address from stride * height; honor CedarC plane padding. */
+    if (pic->pData1 && (uintptr_t)pic->pData1 > (uintptr_t)pic->pData0) { /* 连续半平面地址可提供实际 Y 平面分配大小。 */
+        size_t plane = (uintptr_t)pic->pData1 - (uintptr_t)pic->pData0; /* Y 到 UV 的实际距离包含硬件垂直对齐填充。 */
+        if (stride && plane % stride == 0 && plane / stride >= out->height && /* 只有合理整行对齐的平面间距才用来校正缓冲高度。 */
+            plane / stride <= out->height + 64) /* 限制允许的填充行数量，不盲信异常地址差。 */
+            out->buffer_height = plane / stride; /* 实际平面间距除以 stride，得到 G2D 所需的分配高度。 */
+    }
+    if (pic->nLeftOffset >= 0 && pic->nRightOffset > pic->nLeftOffset && /* 裁剪边界必须有正宽度且在解码缓冲范围内。 */
+        pic->nRightOffset <= pic->nWidth) {
+        out->crop_x = pic->nLeftOffset; /* 直通不裁剪拷贝，交给 G2D 的源 clip 处理。 */
+        out->width = pic->nRightOffset - pic->nLeftOffset; /* 直通描述符的 width 表示有效图像宽度。 */
+    }
+    if (pic->nTopOffset >= 0 && pic->nBottomOffset > pic->nTopOffset && /* 裁剪边界必须有正高度且在解码缓冲范围内。 */
+        pic->nBottomOffset <= pic->nHeight) {
+        out->crop_y = pic->nTopOffset; /* 直通保留垂直裁剪偏移。 */
+        out->height = pic->nBottomOffset - pic->nTopOffset; /* 有效图像高度与 buffer_height 各司其职。 */
+    }
     out->is_nv21 = is_nv21 ? 1U : 0U;/* 保存 UV 顺序。 */
     out->data = (unsigned char *)pic->pData0;   /* 仅用于调试/回退判断。 */
-    out->size = (size_t)stride * out->height * 3U / 2U; /* 按 stride 估算大小。 */
+    out->size = (size_t)stride * out->buffer_height * 3U / 2U; /* 按分配几何描述整个半平面缓冲大小。 */
     out->dmabuf_fd = pic->nBufFd;    /* 关键：把 CedarC buffer fd 暴露给 G2D。 */
     out->direct = 1;                 /* 标记这是 CedarC 直通帧。 */
     out->owner = ctx->decoder;       /* 释放时需要用这个 decoder ReturnPicture。 */
@@ -234,7 +268,7 @@ int image_convert_decode_packet(struct cedar_decoder *ctx,
     if (external_input) {            /* 实验：不拷贝到 CedarC stream buffer。 */
         buf0 = (char *)data;         /* 直接提交调用者传入的压缩数据指针。 */
     } else {                         /* 正常路径：请求 CedarC 内部 stream buffer。 */
-        ret = RequestVideoStreamBuffer((VideoDecoder *)ctx->decoder, (int)size,
+        ret = RequestVideoStreamBuffer((VideoDecoder *)ctx->decoder, (int)size, /* 标准路径申请 CedarC 内部码流环形缓冲，压缩数据仍需 CPU 拷贝。 */
                                        &buf0, &buf0_size, &buf1, &buf1_size, 0);
         if (ret != 0 || (size_t)(buf0_size + buf1_size) < size) {
             fprintf(stderr, "RequestVideoStreamBuffer failed: ret=%d size=%d+%d need=%lu\n",
@@ -259,14 +293,14 @@ int image_convert_decode_packet(struct cedar_decoder *ctx,
     data_info.bIsLastPart = 1;       /* 完整帧最后一段。 */
     data_info.bValid = 1;            /* 数据有效。 */
 
-    ret = SubmitVideoStreamData((VideoDecoder *)ctx->decoder, &data_info, 0);
+    ret = SubmitVideoStreamData((VideoDecoder *)ctx->decoder, &data_info, 0); /* 提交完整压缩包；像素解码由 VE 硬件执行。 */
     if (ret != 0) {                  /* 提交失败。 */
         fprintf(stderr, "SubmitVideoStreamData failed: %d\n", ret);
         return -1;                   /* 返回失败。 */
     }
 
     for (i = 0; i < 40; i++) {       /* 最多等待约 400ms。 */
-        ret = DecodeVideoStream((VideoDecoder *)ctx->decoder, 0, 0, 0, 0);
+        ret = DecodeVideoStream((VideoDecoder *)ctx->decoder, 0, 0, 0, 0); /* 推进解码器状态，H264/H265 可能暂时没有输出图。 */
         if (ret < 0) {               /* 解码出错。 */
             fprintf(stderr, "DecodeVideoStream failed: %d\n", ret);
             break;                   /* 跳出轮询。 */
@@ -274,6 +308,10 @@ int image_convert_decode_packet(struct cedar_decoder *ctx,
         picture = RequestPicture((VideoDecoder *)ctx->decoder, 0); /* 尝试取图。 */
         if (picture)                 /* 取到图像。 */
             break;                   /* 结束轮询。 */
+        /* B 帧等待的是后续压缩包，不是时间，不应空等 400ms。 */
+        if (ctx->codec != CEDAR_VIDEO_CODEC_MJPEG &&
+            ret == VDECODE_RESULT_NO_BITSTREAM)
+            return 0;
         usleep(10000);               /* 等 10ms 再试。 */
     }
 
@@ -299,14 +337,54 @@ int image_convert_decode_packet(struct cedar_decoder *ctx,
 
     if (!force_copy_source() && picture->nBufFd >= 0) { /* 默认优先 CedarC dmabuf 直通。 */
         ret = wrap_direct_picture(ctx, picture, out, is_nv21); /* 直接交给 G2D。 */
+        out->pts_ms = picture->nPts / 1000; /* 使用解码输出 PTS，支持重排帧的真实显示顺序。 */
         return ret == 0 ? 1 : -1;    /* 新语义：1 表示已经拿到一帧图。 */
     }
 
     ret = copy_nv12_or_nv21(picture, out, is_nv21); /* fd 不可用，走拷贝回退。 */
+    out->pts_ms = picture->nPts / 1000; /* 使用解码输出 PTS，支持重排帧的真实显示顺序。 */
     ReturnPicture((VideoDecoder *)ctx->decoder, picture); /* 拷贝完成后归还。 */
     if (ret == 0)                    /* 回退拷贝成功。 */
         ctx->copy_frames++;          /* 统计拷贝帧数。 */
     return ret == 0 ? 1 : -1;        /* 新语义：1 表示已经拿到一帧图。 */
+}
+
+/* EOF 后取出 H264/H265 重排序缓存里的尾帧，不能直接销毁 decoder。 */
+int image_convert_drain(struct cedar_decoder *ctx, struct yuv_image *out)
+{
+    VideoPicture *picture;
+    int ret, nv21;
+    memset(out, 0, sizeof(*out));
+    out->dmabuf_fd = -1;
+    if (ctx->codec == CEDAR_VIDEO_CODEC_MJPEG) /* MJPEG 帧独立，无重排序尾帧需要排出。 */
+        return 0;
+    picture = RequestPicture((VideoDecoder *)ctx->decoder, 0); /* 先取已有输出，再尝试 EOF 解码排尾。 */
+    for (int i = 0; !picture && i < 128; i++) { /* 限制排尾尝试次数，避免无图时无限循环。 */
+        ret = DecodeVideoStream((VideoDecoder *)ctx->decoder, 1, 0, 0, 0); /* 传入 EOF 标志，让硬件输出重排序缓存中的尾帧。 */
+        if (ret < 0)
+            return -1;
+        picture = RequestPicture((VideoDecoder *)ctx->decoder, 0); /* 先取已有输出，再尝试 EOF 解码排尾。 */
+        if (!picture && ret == VDECODE_RESULT_NO_BITSTREAM && /* EOF 下无图且码流缓存空才停止排尾。 */
+            VideoStreamFrameNum((VideoDecoder *)ctx->decoder, 0) == 0) /* 核对内部未解包数量，不提前丢掉重排序缓存。 */
+            break;
+    }
+    if (!picture)
+        return 0;
+    if (!is_picture_nv21(picture) && !is_picture_nv12(picture)) {
+        ReturnPicture((VideoDecoder *)ctx->decoder, picture); /* 消费者不再使用当前图像后归还，允许解码器复用其缓冲。 */
+        return -1;
+    }
+    nv21 = is_picture_nv21(picture);
+    CdcMemFlushCache((struct ScMemOpsS *)ctx->memops, picture->pData0, picture->nBufSize); /* 通过 SDK 内存接口同步解码输出缓存，适配后续硬件读取。 */
+    if (!force_copy_source() && picture->nBufFd >= 0) {
+        ret = wrap_direct_picture(ctx, picture, out, nv21); /* 借用 CedarC dmabuf，free_yuv 必须在 G2D 消费后归还。 */
+        out->pts_ms = picture->nPts / 1000; /* 使用解码输出 PTS，支持重排帧的真实显示顺序。 */
+    } else {
+        ret = copy_nv12_or_nv21(picture, out, nv21); /* 没有可用 fd 时复制紧凑 YUV，再立即归还原始图。 */
+        out->pts_ms = picture->nPts / 1000; /* 使用解码输出 PTS，支持重排帧的真实显示顺序。 */
+        ReturnPicture((VideoDecoder *)ctx->decoder, picture); /* 消费者不再使用当前图像后归还，允许解码器复用其缓冲。 */
+    }
+    return ret == 0 ? 1 : -1; /* 1 表示得到图像，-1 表示转换或包装失败。 */
 }
 
 /* 使用持久化 decoder 解码一帧 MJPG。 */
@@ -315,7 +393,7 @@ int image_convert_decode_mjpeg(struct cedar_decoder *ctx,
                                struct yuv_image *out)
 {
     int ret = image_convert_decode_packet(ctx, jpeg_data, jpeg_size, -1, out);
-    return ret > 0 ? 0 : -1;
+    return ret > 0 ? 0 : -1; /* 旧 MJPEG 接口用 0 表示成功，与 decode_packet 的 1 语义不同。 */
 }
 
 /* 释放一帧 yuv_image。 */
@@ -325,7 +403,7 @@ void image_convert_free_yuv(struct yuv_image *image)
         return;                      /* NULL 直接返回。 */
 
     if (image->direct && image->owner && image->picture) { /* 直通帧属于 CedarC。 */
-        ReturnPicture((VideoDecoder *)image->owner,
+        ReturnPicture((VideoDecoder *)image->owner, /* 直通帧用原解码器归还，不 free SDK 分配的图像数据。 */
                       (VideoPicture *)image->picture); /* 归还给 CedarC。 */
     } else {                         /* 回退拷贝帧属于 malloc。 */
         free(image->data);           /* 释放普通内存。 */

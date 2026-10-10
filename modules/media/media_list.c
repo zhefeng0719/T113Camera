@@ -1,11 +1,13 @@
 #include "media_list.h"
+#include "media_storage.h"
 
 #include <dirent.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
-static int str_ends_with_ci(const char *text, const char *suffix)
+static int str_ends_with_ci(const char *text, const char *suffix) /* 大小写无关的 ASCII 后缀比较，兼容 .JPG 和 .jpg。 */
 {
     size_t text_len;
     size_t suffix_len;
@@ -19,7 +21,7 @@ static int str_ends_with_ci(const char *text, const char *suffix)
     if (suffix_len > text_len)
         return 0;
 
-    tail = text + text_len - suffix_len;
+    tail = text + text_len - suffix_len; /* 仅比较文件名尾部，不能用子串匹配误认格式。 */
     while (*tail != '\0' && *suffix != '\0') {
         char a = *tail++;
         char b = *suffix++;
@@ -35,7 +37,7 @@ static int str_ends_with_ci(const char *text, const char *suffix)
     return 1;
 }
 
-static enum media_type detect_media_type(const char *name)
+static enum media_type detect_media_type(const char *name) /* 扩展名只决定候选类型，实际 codec 支持由播放探测验证。 */
 {
     if (str_ends_with_ci(name, ".mjpeg") || str_ends_with_ci(name, ".mjpg"))
         return MEDIA_TYPE_MJPEG;
@@ -56,9 +58,9 @@ static enum media_type detect_media_type(const char *name)
     return MEDIA_TYPE_UNKNOWN;
 }
 
-static bool is_first_version_playable(enum media_type type)
+static bool is_first_version_playable(enum media_type type) /* 表示有对应播放入口，不保证文件内编码一定可解。 */
 {
-    return type == MEDIA_TYPE_MJPEG ||
+    return type == MEDIA_TYPE_JPEG || type == MEDIA_TYPE_MJPEG ||
            type == MEDIA_TYPE_WAV ||
            type == MEDIA_TYPE_AAC ||
            type == MEDIA_TYPE_MP3 ||
@@ -74,16 +76,19 @@ static int add_media_item(struct media_list *list,
 {
     struct media_item *item;
 
-    if (list->count >= MEDIA_LIST_MAX_ITEMS)
+    if (list->count >= MEDIA_LIST_MAX_ITEMS) /* 有界列表限制内存与 UI 项目数量。 */
         return 0;
-    if (type == MEDIA_TYPE_UNKNOWN)
+    if (type == MEDIA_TYPE_UNKNOWN) /* 临时 .part 或其他未识别文件不加入媒体列表。 */
         return 0;
 
-    item = &list->items[list->count++];
+    if (strlen(path) >= sizeof(list->items[0].path) ||
+        strlen(name) >= sizeof(list->items[0].name))
+        return 0;
+    item = &list->items[list->count++]; /* 长度检查通过后才占用列表槽位。 */
     snprintf(item->path, sizeof(item->path), "%s", path);
     snprintf(item->name, sizeof(item->name), "%s", name);
-    item->type = type;
-    item->playable = is_first_version_playable(type);
+    item->type = type; /* 记录分派类型，应用据此选择照片、音频或容器播放。 */
+    item->playable = is_first_version_playable(type); /* 保留支持标记，不在扫描时打开硬件解码器。 */
     return 1;
 }
 
@@ -92,11 +97,11 @@ static void scan_dir(struct media_list *list, const char *dir_path)
     DIR *dir;
     struct dirent *entry;
 
-    dir = opendir(dir_path);
+    dir = opendir(dir_path); /* 逐目录扫描；目录不存在时该分类为空。 */
     if (dir == NULL)
         return;
 
-    while ((entry = readdir(dir)) != NULL) {
+    while ((entry = readdir(dir)) != NULL) { /* 遍历目录项，不递归进入任意子目录。 */
         char path[MEDIA_LIST_PATH_MAX];
         struct stat st;
         enum media_type type;
@@ -104,21 +109,28 @@ static void scan_dir(struct media_list *list, const char *dir_path)
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             continue;
 
-        snprintf(path, sizeof(path), "%s/%s", dir_path, entry->d_name);
-        if (stat(path, &st) < 0 || !S_ISREG(st.st_mode))
+        int n = snprintf(path, sizeof(path), "%s/%s", dir_path, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path) ||
+            lstat(path, &st) < 0 || !S_ISREG(st.st_mode)) /* 只接收真实普通文件，拒绝符号链接与目录。 */
             continue;
 
-        type = detect_media_type(entry->d_name);
-        add_media_item(list, path, entry->d_name, type);
+        type = detect_media_type(entry->d_name); /* 按名字后缀分类，扫描不进行解码。 */
+        add_media_item(list, path, entry->d_name, type); /* 路径和名称复制到有界列表，不借用 readdir 临时内存。 */
     }
 
-    closedir(dir);
+    closedir(dir); /* 释放目录扫描句柄。 */
 }
 
 void media_list_init(struct media_list *list)
 {
     if (list != NULL)
         memset(list, 0, sizeof(*list));
+}
+
+static int compare_items(const void *a, const void *b)
+{
+    const struct media_item *left = a, *right = b;
+    return strcmp(left->path, right->path); /* 按完整路径稳定排序，使重新扫描后的顺序可预测。 */
 }
 
 int media_list_scan(struct media_list *list, const char *usb_root)
@@ -130,7 +142,7 @@ int media_list_scan(struct media_list *list, const char *usb_root)
         return -1;
 
     media_list_init(list);
-    if (stat(usb_root, &st) < 0 || !S_ISDIR(st.st_mode))
+    if (!media_storage_ready(usb_root, 0) || stat(usb_root, &st) < 0 || !S_ISDIR(st.st_mode))
         return -1;
 
     snprintf(dir, sizeof(dir), "%s/T113Camera/VIDEO", usb_root);
@@ -139,6 +151,7 @@ int media_list_scan(struct media_list *list, const char *usb_root)
     scan_dir(list, dir);
     snprintf(dir, sizeof(dir), "%s/T113Camera/AUDIO", usb_root);
     scan_dir(list, dir);
+    qsort(list->items, list->count, sizeof(list->items[0]), compare_items); /* 扫描完成再统一排序，避免文件系统枚举顺序影响选择。 */
     return 0;
 }
 

@@ -4,7 +4,8 @@
  * T113Camera 的 MJPEG 裸流保存模块。
  *
  * 当前不做视频编码，UVC 摄像头输出的 MJPG 帧本身就是 JPEG 压缩数据。
- * 录制时把多帧 MJPG 顺序写入 video.mjpeg，后续主项目再考虑容器封装。
+ * 保留的裸流测试接口：顺序写 JPEG，不含时间戳或音频。
+ * 正式录制使用 record_writer + ffmpeg_mjpeg_muxer 保存 AVI，不使用此写入器。
  */
 
 #include "mjpeg_save.h"             /* mjpeg_writer 和函数声明。 */
@@ -122,7 +123,7 @@ static int mjpeg_writer_flush_batch(struct mjpeg_writer *writer)
 {
     if (writer->batch_used == 0)    /* 没有待写数据。 */
         return 0;                   /* 直接成功。 */
-    if (fwrite(writer->batch, 1, writer->batch_used, writer->fp) != writer->batch_used) {
+    if (fwrite(writer->batch, 1, writer->batch_used, writer->fp) != writer->batch_used) { /* 批量缓冲必须完整写出，短写返回失败。 */
         perror("write mjpeg");
         return -1;
     }
@@ -144,12 +145,12 @@ int mjpeg_writer_write(struct mjpeg_writer *writer, const void *data, size_t siz
             return -1;
         }
     } else {                        /* 正常帧先进入批量缓冲。 */
-        if (writer->batch_used + size > writer->batch_size) {
+        if (writer->batch_used + size > writer->batch_size) { /* 剩余容量不足时排空，保持 JPEG 原始帧顺序。 */
             if (mjpeg_writer_flush_batch(writer) < 0)
                 return -1;
         }
-        memcpy(writer->batch + writer->batch_used, data, size);
-        writer->batch_used += size;
+        memcpy(writer->batch + writer->batch_used, data, size); /* 复制压缩帧到批量区，调用者返回后可释放源帧。 */
+        writer->batch_used += size; /* 这里只是进入用户态缓冲，不等于数据已落盘。 */
     }
 
     writer->frames++;               /* 累计帧数。 */

@@ -7,6 +7,7 @@ CC := $(CROSS_COMPILE)gcc
 CEDARC := $(SDK)/platform/allwinner/multimedia/libcedarc
 LVGL_ROOT := ui/platform/lvgl
 FFMPEG_ROOT ?= /home/zqboard/thirdparty/ffmpeg-4.4-t113
+FFMPEG_LIBS := $(addprefix $(FFMPEG_ROOT)/lib/,libavformat.a libavcodec.a libswresample.a libavutil.a)
 
 CFLAGS += -Wall -Wextra -O2
 CFLAGS += --sysroot=$(SYSROOT)
@@ -60,6 +61,7 @@ LVGL_SRCS += $(shell find $(LVGL_ROOT)/src/others/sysmon -name '*.c')
 
 SRCS := \
 	src/main.c \
+	modules/common/media_clock.c \
 	modules/audio/audio_alsa.c \
 	modules/audio/audio_capture.c \
 	modules/audio/ffmpeg_audio_player.c \
@@ -70,7 +72,12 @@ SRCS := \
 	modules/media/media_list.c \
 	modules/video/video_capture.c \
 	modules/video/image_convert.c \
+	modules/video/jpeg_info.c \
 	modules/storage/mjpeg_save.c \
+	modules/storage/media_storage.c \
+	modules/storage/storage_monitor.c \
+	modules/storage/record_writer.c \
+	modules/storage/atomic_publish.c \
 	modules/storage/ffmpeg_pcm_demuxer.c \
 	modules/storage/ffmpeg_mjpeg_demuxer.c \
 	modules/storage/ffmpeg_mjpeg_muxer.c \
@@ -83,16 +90,59 @@ SRCS := \
 
 OBJS := $(patsubst %.c,$(OBJ_DIR)/%.o,$(SRCS))
 
-.PHONY: all clean
+.PHONY: all clean integrity-test playback-timing-test storage-test media-regression-test hotplug-test
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
+hotplug-test: $(OUT_DIR)/storage_monitor_test
+
+$(OUT_DIR)/storage_monitor_test: tests/storage_monitor_test.c modules/storage/storage_monitor.c
+	@mkdir -p $(OUT_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lpthread
+
+media-regression-test: $(OUT_DIR)/media_regression_test $(OUT_DIR)/jpeg_render_test $(OUT_DIR)/record_writer_test
+
+$(OUT_DIR)/record_writer_test: tests/record_writer_test.c modules/storage/record_writer.c modules/audio/audio_capture.c modules/audio/audio_alsa.c modules/common/media_clock.c
+	@mkdir -p $(OUT_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -L$(SYSROOT)/usr/lib -lasound -lpthread -lm
+
+$(OUT_DIR)/media_regression_test: tests/media_regression_test.c modules/video/jpeg_info.c modules/common/audio_timeline.h modules/common/ffmpeg_io.h
+	@mkdir -p $(OUT_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^)
+
+$(OUT_DIR)/jpeg_render_test: tests/jpeg_render_test.c modules/video/jpeg_info.c modules/video/image_convert.c modules/display/g2d_display.c
+	@mkdir -p $(OUT_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+storage-test: $(OUT_DIR)/storage_test
+
+$(OUT_DIR)/storage_test: tests/storage_test.c modules/storage/media_storage.c modules/media/media_list.c
+	@mkdir -p $(OUT_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+
+playback-timing-test: $(OUT_DIR)/playback_timing_test
+
+$(OUT_DIR)/playback_timing_test: tests/playback_timing_test.c modules/common/media_clock.c modules/audio/ffmpeg_audio_player.c modules/audio/audio_alsa.c $(FFMPEG_LIBS)
+	@mkdir -p $(OUT_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+# 独立测试封装器：故障注入只链接到此程序，不影响正式应用。
+integrity-test: $(OUT_DIR)/muxer_integrity_test
+
+$(OUT_DIR)/muxer_integrity_test: tests/muxer_integrity_test.c modules/storage/ffmpeg_mjpeg_muxer.c modules/storage/atomic_publish.c modules/storage/ffmpeg_mjpeg_muxer.h $(FFMPEG_LIBS)
+	@mkdir -p $(OUT_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/muxer_integrity_test.c modules/storage/ffmpeg_mjpeg_muxer.c modules/storage/atomic_publish.c \
+		-L$(FFMPEG_ROOT)/lib -lavformat -lavcodec -lswresample -lavutil -lz -latomic -lpthread -lm \
+		-Wl,--wrap=write,--wrap=fsync,--wrap=media_publish_noreplace,--wrap=fstatvfs
+
+$(TARGET): $(OBJS) $(FFMPEG_LIBS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 $(OBJ_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+-include $(OBJS:.o=.d)
 
 clean:
 	rm -rf $(OUT_DIR)

@@ -7,9 +7,9 @@
 
 #define PLAYBACK_QUEUE_CAPACITY 4   /* 播放队列深度：读线程最多领先显示线程 4 帧。 */
 
-struct playback_packet {            /* 播放线程之间传递的一帧 MJPEG packet。 */
-    unsigned char *data;            /* 复制出来的 MJPEG 数据。 */
-    size_t size;                    /* MJPEG 数据长度。 */
+struct playback_packet {            /* 播放线程之间传递的 MJPEG/H264/H265 压缩 packet。 */
+    unsigned char *data;            /* 自有压缩数据副本，packet_free 释放。 */
+    size_t size;                    /* 压缩 packet 有效字节数。 */
     int64_t pts_ms;                 /* 容器时间戳，裸流没有时间戳时为 -1。 */
     int64_t duration_ms;            /* 容器帧时长，缺失时为 -1。 */
     unsigned int index;             /* 帧序号，裸流按它换算显示时间。 */
@@ -31,7 +31,7 @@ struct playback_packet *playback_packet_create(const unsigned char *data,
                                                size_t size,
                                                int64_t pts_ms,
                                                int64_t duration_ms,
-                                               unsigned int index); /* 复制一帧 MJPEG 并生成 packet。 */
+                                               unsigned int index); /* 复制压缩数据并生成带时间戳的自有 packet。 */
 void playback_packet_free(struct playback_packet *packet); /* 释放 packet 和内部数据。 */
 int playback_queue_init(struct playback_packet_queue *queue); /* 初始化队列和同步原语。 */
 void playback_queue_destroy(struct playback_packet_queue *queue); /* 释放残留 packet 并销毁同步原语。 */
@@ -41,5 +41,8 @@ int playback_queue_push(struct playback_packet_queue *queue,
                         struct playback_packet *packet); /* 生产者阻塞式写入 packet。 */
 int playback_queue_pop(struct playback_packet_queue *queue,
                        struct playback_packet **packet); /* 消费者阻塞式读取 packet。 */
+/* 1=取到包，0=暂时为空，-1=结束/停止，避免 UI 被队列等待阻塞。 */
+int playback_queue_try_pop(struct playback_packet_queue *queue,
+                           struct playback_packet **packet);
 
 #endif

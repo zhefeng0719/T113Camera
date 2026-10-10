@@ -12,12 +12,12 @@ static int frame_queue_should_stop(const struct frame_queue *queue)
     return 0;                       /* 仍可继续工作。 */
 }
 
-void frame_packet_add_ref(struct frame_packet *packet)
+void frame_packet_add_ref(struct frame_packet *packet) /* 每个新增消费者应增加一次引用；此实现保留作共享 V4L2 帧接口。 */
 {
     __sync_add_and_fetch(&packet->refs, 1); /* GCC 原子加一，适配当前交叉工具链。 */
 }
 
-void frame_packet_release(struct frame_packet *packet)
+void frame_packet_release(struct frame_packet *packet) /* 最后一个引用才 QBUF；摄像头上下文必须存活到所有引用释放。 */
 {
     if (packet == NULL)             /* 空指针不用处理。 */
         return;                     /* 直接返回。 */
@@ -103,7 +103,7 @@ void frame_queue_destroy(struct frame_queue *queue)
 int frame_queue_push_wait(struct frame_queue *queue, struct frame_packet *packet)
 {
     pthread_mutex_lock(&queue->mutex); /* 加锁访问队列。 */
-    while (!frame_queue_should_stop(queue) && queue->count == queue->capacity)
+    while (!frame_queue_should_stop(queue) && queue->count == queue->capacity) /* 循环检查满队列谓词，兼容虚假唤醒与停止广播。 */
         pthread_cond_wait(&queue->not_full, &queue->mutex); /* 满队列等待。 */
 
     if (frame_queue_should_stop(queue)) { /* 停止时不再接收新帧。 */
@@ -151,7 +151,7 @@ struct frame_packet *frame_queue_pop(struct frame_queue *queue)
     struct frame_packet *packet;    /* 取出的帧。 */
 
     pthread_mutex_lock(&queue->mutex); /* 加锁访问队列。 */
-    while (!queue->stopped && queue->count == 0)
+    while (!queue->stopped && queue->count == 0) /* 空队列阻塞等数据；stop 必须广播条件变量才能及时唤醒。 */
         pthread_cond_wait(&queue->not_empty, &queue->mutex); /* 队空时等待新帧。 */
 
     if (queue->count == 0) {        /* 停止后队列已经取空。 */

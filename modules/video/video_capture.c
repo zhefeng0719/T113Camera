@@ -8,6 +8,7 @@
  */
 
 #include "video_capture.h"          /* 本模块对外暴露的结构体和函数声明。 */
+#include <time.h>
 
 #include <errno.h>                  /* errno / EINTR，用于判断系统调用错误原因。 */
 #include <fcntl.h>                  /* open() 的 O_RDWR、O_NONBLOCK 等标志。 */
@@ -31,7 +32,7 @@ static int xioctl(int fd, unsigned long request, void *arg)
     int ret;                        /* 保存 ioctl 返回值。 */
 
     do {                            /* ioctl 可能被信号打断。 */
-        ret = ioctl(fd, request, arg);
+        ret = ioctl(fd, request, arg); /* ioctl 被 EINTR 中断时由外层循环重试原请求。 */
     } while (ret == -1 && errno == EINTR);
 
     return ret;                     /* 成功返回 0 或正数，失败返回 -1。 */
@@ -115,18 +116,19 @@ int video_capture_open(struct video_capture *cap, const char *device,
         fprintf(stderr, "pthread_mutex_init capture failed\n");
         return -1;
     }
-    cap->mutex_ready = 1;
+    cap->mutex_ready = 1; /* 标记互斥锁已初始化，部分初始化失败时也能安全清理。 */
 
-    cap->fd = open(device, O_RDWR | O_NONBLOCK);
+    cap->fd = open(device, O_RDWR | O_NONBLOCK); /* 非阻塞打开；等待数据由 select 负责。 */
     if (cap->fd < 0) {
         perror("open camera");
+        video_capture_close(cap); /* 部分初始化失败时回收已经成功映射和打开的资源。 */
         return -1;
     }
 
     memset(&capability, 0, sizeof(capability));
     if (xioctl(cap->fd, VIDIOC_QUERYCAP, &capability) < 0) {
         perror("VIDIOC_QUERYCAP");
-        video_capture_close(cap);
+        video_capture_close(cap); /* 部分初始化失败时回收已经成功映射和打开的资源。 */
         return -1;
     }
 
@@ -139,7 +141,7 @@ int video_capture_open(struct video_capture *cap, const char *device,
 
     if (xioctl(cap->fd, VIDIOC_S_FMT, &format) < 0) {
         perror("VIDIOC_S_FMT");
-        video_capture_close(cap);
+        video_capture_close(cap); /* 部分初始化失败时回收已经成功映射和打开的资源。 */
         return -1;
     }
 
@@ -148,7 +150,7 @@ int video_capture_open(struct video_capture *cap, const char *device,
         fourcc_to_str(format.fmt.pix.pixelformat, got);
         fourcc_to_str(pixfmt, want);
         fprintf(stderr, "camera selected %s, want %s\n", got, want);
-        video_capture_close(cap);
+        video_capture_close(cap); /* 部分初始化失败时回收已经成功映射和打开的资源。 */
         return -1;
     }
 
@@ -158,25 +160,25 @@ int video_capture_open(struct video_capture *cap, const char *device,
 
     memset(&req, 0, sizeof(req));                    /* 申请摄像头采集缓冲区。 */
     req.count = 8;                                   /* 引用计数会延长占用时间，多申请几个缓冲。 */
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; /* 单平面视频采集队列，与 MJPEG 格式匹配。 */
     req.memory = V4L2_MEMORY_MMAP;                   /* 使用 mmap，避免频繁拷贝。 */
 
     if (xioctl(cap->fd, VIDIOC_REQBUFS, &req) < 0) {
         perror("VIDIOC_REQBUFS");
-        video_capture_close(cap);
+        video_capture_close(cap); /* 部分初始化失败时回收已经成功映射和打开的资源。 */
         return -1;
     }
 
     if (req.count < 2) {                             /* 至少需要 2 个缓冲才能稳定流式采集。 */
         fprintf(stderr, "not enough camera mmap buffers\n");
-        video_capture_close(cap);
+        video_capture_close(cap); /* 部分初始化失败时回收已经成功映射和打开的资源。 */
         return -1;
     }
 
-    cap->buffers = calloc(req.count, sizeof(*cap->buffers));
+    cap->buffers = calloc(req.count, sizeof(*cap->buffers)); /* 创建映射描述符数组，不是分配摄像头帧的用户态副本。 */
     if (!cap->buffers) {
         perror("calloc buffers");
-        video_capture_close(cap);
+        video_capture_close(cap); /* 部分初始化失败时回收已经成功映射和打开的资源。 */
         return -1;
     }
     cap->buffer_count = req.count;                   /* 记录驱动实际给了几个缓冲。 */
@@ -184,24 +186,24 @@ int video_capture_open(struct video_capture *cap, const char *device,
     for (i = 0; i < req.count; i++) {
         struct v4l2_buffer buf;                      /* 查询第 i 个缓冲的位置和大小。 */
 
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = i;
+        memset(&buf, 0, sizeof(buf)); /* 清空保留字段，避免 ioctl 接收随机标志。 */
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; /* 每次队列 ioctl 都显式声明同一采集类型。 */
+        buf.memory = V4L2_MEMORY_MMAP; /* 传入驱动 MMAP 槽位索引，不传用户指针。 */
+        buf.index = i; /* QUERYBUF/QBUF 必须使用驱动返回范围内的槽位编号。 */
 
         if (xioctl(cap->fd, VIDIOC_QUERYBUF, &buf) < 0) {
             perror("VIDIOC_QUERYBUF");
-            video_capture_close(cap);
+            video_capture_close(cap); /* 部分初始化失败时回收已经成功映射和打开的资源。 */
             return -1;
         }
 
-        cap->buffers[i].length = buf.length;
-        cap->buffers[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
-                                     MAP_SHARED, cap->fd, buf.m.offset);
+        cap->buffers[i].length = buf.length; /* 保存映射大小，有效 JPEG 大小另由 bytesused 返回。 */
+        cap->buffers[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, /* 映射已申请的驱动槽，不在此处复制压缩帧。 */
+                                     MAP_SHARED, cap->fd, buf.m.offset); /* 将驱动采集缓冲映射入进程，共享原始 MJPEG 数据。 */
         if (cap->buffers[i].start == MAP_FAILED) {
             perror("mmap");
             cap->buffers[i].start = NULL;
-            video_capture_close(cap);
+            video_capture_close(cap); /* 部分初始化失败时回收已经成功映射和打开的资源。 */
             return -1;
         }
     }
@@ -218,22 +220,22 @@ int video_capture_start(struct video_capture *cap)
     for (i = 0; i < cap->buffer_count; i++) {
         struct v4l2_buffer buf;              /* 要入队的缓冲。 */
 
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = i;
+        memset(&buf, 0, sizeof(buf)); /* 清空保留字段，避免 ioctl 接收随机标志。 */
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; /* 每次队列 ioctl 都显式声明同一采集类型。 */
+        buf.memory = V4L2_MEMORY_MMAP; /* 传入驱动 MMAP 槽位索引，不传用户指针。 */
+        buf.index = i; /* QUERYBUF/QBUF 必须使用驱动返回范围内的槽位编号。 */
 
-    pthread_mutex_lock(&cap->ioctl_mutex);
-    if (xioctl(cap->fd, VIDIOC_QBUF, &buf) < 0) {
-        pthread_mutex_unlock(&cap->ioctl_mutex);
+    pthread_mutex_lock(&cap->ioctl_mutex); /* 串行化不同消费线程归还缓冲与采集线程的队列操作。 */
+    if (xioctl(cap->fd, VIDIOC_QBUF, &buf) < 0) { /* 将槽位归还驱动；失败需要上层停止会话。 */
+        pthread_mutex_unlock(&cap->ioctl_mutex); /* 完成 ioctl 后立即解锁，不在锁内等待消费者处理。 */
             perror("VIDIOC_QBUF");
             return -1;
         }
-    pthread_mutex_unlock(&cap->ioctl_mutex);
+    pthread_mutex_unlock(&cap->ioctl_mutex); /* 完成 ioctl 后立即解锁，不在锁内等待消费者处理。 */
     }
 
     type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (xioctl(cap->fd, VIDIOC_STREAMON, &type) < 0) {
+    if (xioctl(cap->fd, VIDIOC_STREAMON, &type) < 0) { /* 所有可用槽排队后启动 UVC 采集。 */
         perror("VIDIOC_STREAMON");
         return -1;
     }
@@ -249,12 +251,12 @@ int video_capture_get_frame(struct video_capture *cap, struct video_frame *frame
     struct timeval tv;                       /* select 超时时间。 */
     int ret;                                 /* select 返回值。 */
 
-    FD_ZERO(&fds);
-    FD_SET(cap->fd, &fds);
+    FD_ZERO(&fds); /* 清空 select 集合，每次等待都要重新构建。 */
+    FD_SET(cap->fd, &fds); /* 只等待当前摄像头节点可读。 */
     tv.tv_sec = 2;                           /* 最多等 2 秒，避免程序卡死。 */
     tv.tv_usec = 0;
 
-    ret = select(cap->fd + 1, &fds, NULL, NULL, &tv);
+    ret = select(cap->fd + 1, &fds, NULL, NULL, &tv); /* 有帧或超时后返回；该超时不能抢占卡住的 ioctl。 */
     if (ret <= 0) {
         if (ret == 0)
             fprintf(stderr, "camera dequeue timeout\n");
@@ -263,17 +265,17 @@ int video_capture_get_frame(struct video_capture *cap, struct video_frame *frame
         return -1;
     }
 
-    memset(&buf, 0, sizeof(buf));
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
+    memset(&buf, 0, sizeof(buf)); /* 清空保留字段，避免 ioctl 接收随机标志。 */
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; /* 每次队列 ioctl 都显式声明同一采集类型。 */
+    buf.memory = V4L2_MEMORY_MMAP; /* 传入驱动 MMAP 槽位索引，不传用户指针。 */
 
-    pthread_mutex_lock(&cap->ioctl_mutex);
-    if (xioctl(cap->fd, VIDIOC_DQBUF, &buf) < 0) {
-        pthread_mutex_unlock(&cap->ioctl_mutex);
+    pthread_mutex_lock(&cap->ioctl_mutex); /* 串行化不同消费线程归还缓冲与采集线程的队列操作。 */
+    if (xioctl(cap->fd, VIDIOC_DQBUF, &buf) < 0) { /* 从驱动取出完成帧；缓冲暂时归应用持有。 */
+        pthread_mutex_unlock(&cap->ioctl_mutex); /* 完成 ioctl 后立即解锁，不在锁内等待消费者处理。 */
         perror("VIDIOC_DQBUF");
         return -1;
     }
-    pthread_mutex_unlock(&cap->ioctl_mutex);
+    pthread_mutex_unlock(&cap->ioctl_mutex); /* 完成 ioctl 后立即解锁，不在锁内等待消费者处理。 */
 
     if (buf.index >= cap->buffer_count) {    /* 防御驱动返回异常索引。 */
         fprintf(stderr, "invalid camera buffer index %u\n", buf.index);
@@ -284,6 +286,20 @@ int video_capture_get_frame(struct video_capture *cap, struct video_frame *frame
     frame->size = buf.bytesused;                     /* 本帧实际有效字节数。 */
     frame->index = buf.index;                        /* 保存索引，归还时要用。 */
     frame->sequence = buf.sequence;                  /* 摄像头帧序号，便于调试。 */
+    if (!frame->size || frame->size > cap->buffers[buf.index].length ||
+        (buf.flags & V4L2_BUF_FLAG_ERROR)) { /* 驱动标记的坏帧不送解码或保存。 */
+        video_capture_put_frame(cap, frame); /* 异常帧也尽量归还缓冲，避免耗尽驱动队列。 */
+        fprintf(stderr, "invalid camera frame size/flags\n");
+        return -1;
+    }
+    if ((buf.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC && /* 只信任明确声明为单调时钟的驱动时间戳。 */
+        (buf.timestamp.tv_sec || buf.timestamp.tv_usec)) {
+        frame->timestamp_us = (int64_t)buf.timestamp.tv_sec * 1000000 + buf.timestamp.tv_usec; /* 优先采用驱动单调采集时间，写盘延迟不影响录制 PTS。 */
+    } else {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now); /* 驱动没有可用单调时间戳时，以取帧时刻作为退化估计。 */
+        frame->timestamp_us = (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000; /* 退化时间可能包含调度延迟，不等价于硬件曝光时刻。 */
+    }
     return 0;
 }
 
@@ -292,18 +308,18 @@ int video_capture_put_frame(struct video_capture *cap, const struct video_frame 
 {
     struct v4l2_buffer buf;                  /* 要重新入队的缓冲。 */
 
-    memset(&buf, 0, sizeof(buf));
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    buf.index = frame->index;
+    memset(&buf, 0, sizeof(buf)); /* 清空保留字段，避免 ioctl 接收随机标志。 */
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; /* 每次队列 ioctl 都显式声明同一采集类型。 */
+    buf.memory = V4L2_MEMORY_MMAP; /* 传入驱动 MMAP 槽位索引，不传用户指针。 */
+    buf.index = frame->index; /* 按原始槽位重新 QBUF，归还后 data 指针不能继续访问。 */
 
-    pthread_mutex_lock(&cap->ioctl_mutex);
-    if (xioctl(cap->fd, VIDIOC_QBUF, &buf) < 0) {
-        pthread_mutex_unlock(&cap->ioctl_mutex);
+    pthread_mutex_lock(&cap->ioctl_mutex); /* 串行化不同消费线程归还缓冲与采集线程的队列操作。 */
+    if (xioctl(cap->fd, VIDIOC_QBUF, &buf) < 0) { /* 将槽位归还驱动；失败需要上层停止会话。 */
+        pthread_mutex_unlock(&cap->ioctl_mutex); /* 完成 ioctl 后立即解锁，不在锁内等待消费者处理。 */
         perror("VIDIOC_QBUF return");
         return -1;
     }
-    pthread_mutex_unlock(&cap->ioctl_mutex);
+    pthread_mutex_unlock(&cap->ioctl_mutex); /* 完成 ioctl 后立即解锁，不在锁内等待消费者处理。 */
 
     return 0;
 }
@@ -315,7 +331,7 @@ void video_capture_stop(struct video_capture *cap)
 
     if (cap->fd >= 0) {
         type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        xioctl(cap->fd, VIDIOC_STREAMOFF, &type);
+        xioctl(cap->fd, VIDIOC_STREAMOFF, &type); /* 调用前停止并收拢消费者，驱动撤销所有排队缓冲。 */
     }
 }
 
@@ -330,16 +346,16 @@ void video_capture_close(struct video_capture *cap)
     if (cap->buffers) {
         for (i = 0; i < cap->buffer_count; i++) {
             if (cap->buffers[i].start && cap->buffers[i].length)
-                munmap(cap->buffers[i].start, cap->buffers[i].length);
+                munmap(cap->buffers[i].start, cap->buffers[i].length); /* 消费者不再持有帧后才解除映射。 */
         }
-        free(cap->buffers);
+        free(cap->buffers); /* 解除每个有效映射后回收描述符数组。 */
     }
 
     if (cap->fd >= 0)
-        close(cap->fd);
+        close(cap->fd); /* 最后释放摄像头设备句柄。 */
     if (cap->mutex_ready)
-        pthread_mutex_destroy(&cap->ioctl_mutex);
+        pthread_mutex_destroy(&cap->ioctl_mutex); /* 最后释放队列操作锁，不能与仍运行的线程并发。 */
 
     memset(cap, 0, sizeof(*cap));            /* 避免外部误用旧指针和旧 fd。 */
-    cap->fd = -1;
+    cap->fd = -1; /* 关闭后的上下文不能继续执行队列 ioctl。 */
 }

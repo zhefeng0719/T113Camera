@@ -4,27 +4,32 @@
  * T113Camera 第一版整合入口。
  *
  * 运行方式：
- *   ./t113_camera        实时预览，按 Ctrl+C 退出。
- *   ./t113_camera 5      录制 5 秒 MJPEG 裸流到 U 盘，同时屏幕预览。
+ *   ./t113_camera        播放列表与三按键交互，按 Ctrl+C 退出。
+ *   ./t113_camera 5      定时录制 5 秒 MJPEG + PCM AVI，同时屏幕预览。
  */
 
 #include "disp_layer_display.h"     /* /dev/disp layer 显示接口。 */
 #include "ffmpeg_audio_player.h"    /* FFmpeg AAC/MP3/PCM 音频播放接口。 */
 #include "ffmpeg_mjpeg_demuxer.h"   /* FFmpeg MJPEG 容器解封装接口。 */
 #include "ffmpeg_mjpeg_muxer.h"     /* FFmpeg MJPEG/PCM AVI 封装接口。 */
-#include "frame_queue.h"            /* 录制/预览线程之间共享 MJPG 帧的队列。 */
 #include "g2d_display.h"            /* G2D YUV->RGB + 缩放显示接口。 */
 #include "image_convert.h"          /* CedarC MJPG->YUV 解码接口。 */
+#include "jpeg_info.h"
 #include "input_key.h"              /* 三个用户按键输入接口。 */
 #include "media_list.h"             /* U 盘媒体文件扫描接口。 */
+#include "media_storage.h"          /* 挂载检查、自动命名和 JPEG 原子保存。 */
+#include "storage_monitor.h"        /* 独立存储监控，只传状态和取消信号。 */
+#include "record_writer.h"
 #include "playback_queue.h"         /* 播放读取线程和显示线程之间的 packet 队列。 */
 #include "t113_ui_lvgl.h"           /* LVGL GUI Guider 界面显示接口。 */
 #include "audio_capture.h"          /* ALSA PCM 音频采集队列。 */
 #include "audio_alsa.h"             /* ALSA PCM 播放接口。 */
+#include "media_clock.h"
 #include "wav_player.h"             /* PCM WAV 文件播放接口。 */
 #include "video_capture.h"          /* V4L2 摄像头采集接口。 */
 
 #include <errno.h>                  /* errno。 */
+#include <fcntl.h>
 #include <limits.h>                 /* LONG_MIN / LONG_MAX。 */
 #include <linux/videodev2.h>        /* V4L2_PIX_FMT_MJPEG。 */
 #include <pthread.h>                /* pthread 线程、互斥锁、条件变量。 */
@@ -33,17 +38,16 @@
 #include <stdlib.h>                 /* strtol。 */
 #include <string.h>                 /* memset。 */
 #include <sys/wait.h>               /* WIFEXITED / WEXITSTATUS。 */
+#include <sys/file.h>
 #include <time.h>                   /* clock_gettime。 */
 #include <unistd.h>                 /* usleep。 */
 
 #define DEFAULT_DEVICE "/dev/video0"/* USB UVC 摄像头采集节点。 */
 #define DEFAULT_WIDTH 640           /* 摄像头采集宽度。 */
 #define DEFAULT_HEIGHT 480          /* 摄像头采集高度。 */
-#define USB_ROOT "/mnt/usb/sda"     /* 当前项目约定的 U 盘挂载路径。 */
+#define USB_ROOT g_storage_root     /* 实际挂载路径；只由应用主线程更新。 */
 #define INPUT_DEVICE "/dev/input/event1" /* 当前已验证的三个用户按键节点。 */
-#define RECORD_QUEUE_CAPACITY FRAME_QUEUE_MAX_CAPACITY /* 录制队列深度：优先保存完整帧。 */
-#define PREVIEW_QUEUE_CAPACITY 2    /* 预览队列深度：小队列降低显示延迟。 */
-#define AUDIO_QUEUE_CAPACITY 16     /* 音频队列深度：约 16 * 1024/48k = 341ms。 */
+#define AUDIO_QUEUE_CAPACITY 64     /* Bounded PCM backlog: about 1.36 seconds at 48 kHz. */
 #define PLAYER_FPS 60U              /* MJPEG 裸流无时间戳，按 60fps 作为目标显示节奏。 */
 #define CONTAINER_VIDEO_FPS 30U     /* 当前 MP4/AVI 容器视频先按 30fps 显示。 */
 
@@ -52,6 +56,8 @@ enum playback_result {
     PLAYBACK_RESULT_END = 0,        /* 正常播放到文件结束。 */
     PLAYBACK_RESULT_NEXT = 1,       /* 播放中短按 NEXT，停止播放并切换下一项。 */
     PLAYBACK_RESULT_PREV = 2,       /* 播放中短按 ENTER，停止播放并切换上一项。 */
+    PLAYBACK_RESULT_RECORD = 3,     /* 长按中键：先关闭播放，再进入相机。 */
+    PLAYBACK_RESULT_STORAGE_LOST = 4, /* 存储会话取消，不得误报为文件正常播放完毕。 */
 };
 
 static const char *const g_record_names[] = { /* 录制模式左侧可选文件名。 */
@@ -63,6 +69,19 @@ static const char *const g_record_names[] = { /* 录制模式左侧可选文件�
 };
 
 static volatile sig_atomic_t g_stop;/* Ctrl+C 信号会把它置 1，主循环据此退出。 */
+static struct storage_monitor g_storage; /* 应用拥有监控线程，模块之间不互相调用。 */
+static char g_storage_root[512];    /* 当前确认的挂载路径；缺盘时为空，禁止落盘到 flash。 */
+static int g_storage_enabled;      /* 不使用 U 盘的独立显示命令无需监控。 */
+
+static int storage_session_lost(void)
+{
+    return g_storage_enabled && storage_monitor_cancelled(&g_storage); /* 播放/录制循环共用失效条件。 */
+}
+
+static void storage_bind_task(volatile int *stop)
+{
+    if (g_storage_enabled) storage_monitor_bind(&g_storage, stop); /* 绑定和解绑保证栈变量生命周期。 */
+}
 
 struct fps_meter;                  /* 前置声明：FPS 辅助函数参数要用。 */
 static void kill_lvgl_demo(void);   /* 前置声明：run_ui 也要停掉开机 demo。 */
@@ -87,6 +106,8 @@ struct mkv_source_worker {
 
 /* AVI 音频播放线程上下文。 */
 struct avi_audio_worker {
+    struct media_clock *clock;      /* 音频硬件播放位置供视频调度读取。 */
+    int done;                      /* release/acquire 发布线程结束和结果。 */
     const char *path;               /* 当前 AVI 文件路径。 */
     volatile int *stop;             /* 主线程退出播放时置 1。 */
     volatile int *paused;           /* 主线程暂停播放时置 1。 */
@@ -104,34 +125,6 @@ struct wav_play_worker {
     int ret;                        /* 播放结果。 */
 };
 
-/* 保存线程上下文。 */
-struct record_worker {
-    struct frame_queue *queue;      /* 保存线程消费的 MJPG 队列。 */
-    struct ffmpeg_mjpeg_muxer *writer; /* U 盘 MKV 封装器。 */
-    int ret;                        /* 线程执行结果。 */
-};
-
-/* 预览线程上下文。 */
-struct preview_worker {
-    struct frame_queue *queue;      /* 预览线程消费的 MJPG 队列。 */
-    struct disp_layer_display *disp;/* /dev/disp layer 显示上下文。 */
-    struct g2d_display *g2d;        /* G2D 显示上下文。 */
-    struct cedar_decoder *decoder;  /* CedarC 持久化解码器。 */
-    unsigned int frames;            /* 成功显示的帧数。 */
-    int ret;                        /* 线程执行结果。 */
-};
-
-/* 采集线程上下文。 */
-struct capture_worker {
-    struct video_capture *cap;      /* 已经打开并启动的 V4L2 摄像头。 */
-    struct frame_queue *record_queue;  /* 送给保存线程的队列。 */
-    struct frame_queue *preview_queue; /* 送给预览线程的队列。 */
-    int seconds;                    /* 录制秒数。 */
-    unsigned int captured;          /* 采集到的帧数。 */
-    unsigned int preview_dropped;   /* 预览队列主动丢弃的旧帧数量。 */
-    int ret;                        /* 线程执行结果。 */
-};
-
 /* 录制模式预览上下文：把摄像头实时画面显示到 UI 的 vedioplay 区域。 */
 struct record_preview {
     int opened;                     /* 资源是否已经打开。 */
@@ -141,6 +134,7 @@ struct record_preview {
     struct g2d_display g2d;          /* G2D 缩放/格式转换。 */
     struct cedar_decoder decoder;    /* CedarC MJPG 解码器。 */
     struct ffmpeg_mjpeg_muxer writer; /* 录制模式使用的 MKV 封装器。 */
+    struct record_writer sink;       /* USB writes never run on the preview/UI thread. */
     struct audio_queue audio_queue;  /* 录制模式音频 PCM 队列。 */
     struct audio_capture_worker audio_worker; /* ALSA 音频采集线程参数。 */
     pthread_t audio_thread;          /* ALSA 音频采集线程。 */
@@ -187,7 +181,7 @@ static void print_usage(const char *prog)
 }
 
 /* 一次性读入一个文件，当前用于第一版 MJPEG 裸流播放。 */
-static int read_file_all(const char *path, unsigned char **data, size_t *size)
+static int read_file_all(const char *path, unsigned char **data, size_t *size) /* 照片与裸 MJPEG 的整文件读取辅助；容器播放使用流式解封装。 */
 {
     FILE *fp;                       /* 文件句柄。 */
     long length;                    /* 文件长度。 */
@@ -208,7 +202,7 @@ static int read_file_all(const char *path, unsigned char **data, size_t *size)
         return -1;                  /* 返回失败。 */
     }
     length = ftell(fp);             /* 读取文件长度。 */
-    if (length <= 0) {              /* 空文件或获取失败。 */
+    if (length <= 0 || length > 16L * 1024 * 1024) { /* 小内存板限制整文件载入，容器播放不受影响。 */
         fprintf(stderr, "invalid video file size\n");
         fclose(fp);                 /* 关闭文件。 */
         return -1;                  /* 返回失败。 */
@@ -226,7 +220,15 @@ static int read_file_all(const char *path, unsigned char **data, size_t *size)
         return -1;                  /* 返回失败。 */
     }
 
-    if (fread(buffer, 1, (size_t)length, fp) != (size_t)length) { /* 读完整文件。 */
+    size_t offset = 0; /* 分块读取，块与块之间检查停止信号。 */
+    while (offset < (size_t)length && !g_stop && !storage_session_lost()) { /* 不能强制打断单次内核 read。 */
+        size_t chunk = (size_t)length - offset; /* 当前剩余字节数。 */
+        if (chunk > 65536) chunk = 65536; /* 每次最多读取 64 KiB。 */
+        size_t count = fread(buffer + offset, 1, chunk, fp); /* 有界文件读取。 */
+        offset += count; /* 累加实际读取长度。 */
+        if (count != chunk) break; /* EOF 或错误均停止读取。 */
+    }
+    if (offset != (size_t)length || storage_session_lost()) { /* 不交付失效会话的图像。 */
         perror("fread video");     /* 打印错误。 */
         free(buffer);               /* 释放缓冲。 */
         fclose(fp);                 /* 关闭文件。 */
@@ -276,33 +278,7 @@ static int find_next_jpeg_frame(const unsigned char *data,
                                 const unsigned char **frame,
                                 size_t *frame_size)
 {
-    size_t pos = *offset;           /* 从上次结束位置继续找。 */
-    size_t start;                   /* JPEG SOI 起点。 */
-    size_t end;                     /* JPEG EOI 终点。 */
-
-    while (pos + 1 < size) {        /* 查找 SOI。 */
-        if (data[pos] == 0xff && data[pos + 1] == 0xd8)
-            break;                  /* 找到 JPEG 起点。 */
-        pos++;                      /* 继续搜索。 */
-    }
-    if (pos + 1 >= size)            /* 没有找到 SOI。 */
-        return 0;                   /* 表示没有更多帧。 */
-    start = pos;                    /* 记录起点。 */
-    pos += 2;                       /* 跳过 SOI。 */
-
-    while (pos + 1 < size) {        /* 查找 EOI。 */
-        if (data[pos] == 0xff && data[pos + 1] == 0xd9)
-            break;                  /* 找到 JPEG 终点。 */
-        pos++;                      /* 继续搜索。 */
-    }
-    if (pos + 1 >= size)            /* 没有完整 EOI。 */
-        return 0;                   /* 表示没有更多完整帧。 */
-    end = pos + 2;                  /* EOI 两个字节也属于本帧。 */
-
-    *frame = data + start;          /* 输出帧起点。 */
-    *frame_size = end - start;      /* 输出帧长度。 */
-    *offset = end;                  /* 下次从本帧后继续找。 */
-    return 1;                       /* 找到一帧。 */
+    return jpeg_next_frame(data, size, offset, frame, frame_size); /* 按 JPEG 段结构找完整帧，不能搜索第一个 0xffd9 就截断 EXIF 主图。 */
 }
 
 /* 统计 MJPEG 裸流中完整 JPEG 帧数量，用来把进度条和实际播放帧数挂钩。 */
@@ -328,7 +304,7 @@ static unsigned int count_mjpeg_frames(const unsigned char *data, size_t size)
 /* 把帧数换算成毫秒，用于让播放进度条和播放时长挂钩。 */
 static uint32_t frames_to_ms(unsigned int frames)
 {
-    return (uint32_t)(((unsigned long long)frames * 1000ULL) / PLAYER_FPS);
+    return (uint32_t)(((unsigned long long)frames * 1000ULL) / PLAYER_FPS); /* 裸 MJPEG 无 PTS，只能按约定帧率估算时长；AVI 不使用此估算。 */
 }
 
 /* 更新播放进度条，value/max 都使用毫秒单位。 */
@@ -368,8 +344,8 @@ static void wav_progress_cb(uint32_t played_ms, uint32_t total_ms, void *user)
 
     if (worker == NULL)
         return;
-    worker->played_ms = played_ms;  /* 只写普通数值，LVGL 刷新留给主线程。 */
-    worker->total_ms = total_ms;
+    __atomic_store_n(&worker->played_ms, played_ms, __ATOMIC_RELEASE); /* 音频线程发布进度，控制线程通过 acquire 读取。 */
+    __atomic_store_n(&worker->total_ms, total_ms, __ATOMIC_RELEASE); /* 跨线程发布总时长，不从音频线程直接操作 LVGL。 */
 }
 
 /* 给 timespec 增加指定毫秒，供绝对时间调度使用。 */
@@ -411,7 +387,7 @@ static void sleep_until_monotonic(struct timespec target)
     if (diff_ns > 100000000LL)      /* 防止异常 PTS 让画面长时间停住。 */
         diff_ns = 100000000LL;      /* 单次最多等待 100ms。 */
     do {
-        ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME,
+        ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, /* 等待绝对截止时刻，避免逐帧相对 sleep 累积执行耗时。 */
                               &target, NULL); /* 绝对时间睡眠，避免累计误差。 */
     } while (ret == EINTR);         /* 被信号打断时继续睡到同一个目标时间。 */
 }
@@ -421,14 +397,7 @@ static int64_t playback_due_ms(unsigned int frame_index, int64_t pts_ms)
 {
     if (pts_ms >= 0)                /* MKV 优先使用容器 PTS。 */
         return pts_ms;              /* PTS 本身就是从 0 开始的毫秒。 */
-    return (int64_t)(((unsigned long long)frame_index * 1000ULL) / PLAYER_FPS);
-}
-
-/* H264/H265 硬解输出有重排序，先用固定 30fps 控制容器视频显示节奏。 */
-static int64_t container_video_due_ms(unsigned int frame_index)
-{
-    return (int64_t)(((unsigned long long)frame_index * 1000ULL) /
-                     CONTAINER_VIDEO_FPS);
+    return (int64_t)(((unsigned long long)frame_index * 1000ULL) / PLAYER_FPS); /* 仅缺失时间戳时以帧序号和默认帧率退化调度。 */
 }
 
 /* 如果 LVGL 有新内容刷新，就重新提交 UI 图层。 */
@@ -437,6 +406,8 @@ static int submit_ui_if_dirty(struct disp_layer_display *disp,
                               uint32_t *last_flush)
 {
     uint32_t flush_now;             /* 当前 LVGL flush 次数。 */
+    if (ui->present_failed)
+        return -1;
 
     t113_ui_lvgl_tick(ui);          /* 让 LVGL 处理一次定时器。 */
     flush_now = t113_ui_lvgl_get_flush_count(ui); /* 读取刷新计数。 */
@@ -444,10 +415,7 @@ static int submit_ui_if_dirty(struct disp_layer_display *disp,
         return 0;                   /* 没有新画面。 */
 
     *last_flush = flush_now;        /* 更新已提交计数。 */
-    return disp_layer_display_show_argb8888(disp,
-                                            t113_ui_lvgl_get_dmabuf_fd(ui),
-                                            t113_ui_lvgl_get_width(ui),
-                                            t113_ui_lvgl_get_height(ui));
+    return t113_ui_lvgl_present(ui, disp);
 }
 
 /* 强制提交一次 UI 图层，用于模式切换后立刻覆盖旧画面。 */
@@ -457,10 +425,7 @@ static int submit_ui_force(struct disp_layer_display *disp,
 {
     t113_ui_lvgl_tick(ui);          /* 先让 LVGL 处理刚设置的文字/列表。 */
     *last_flush = t113_ui_lvgl_get_flush_count(ui); /* 同步刷新计数。 */
-    return disp_layer_display_show_argb8888(disp,
-                                            t113_ui_lvgl_get_dmabuf_fd(ui),
-                                            t113_ui_lvgl_get_width(ui),
-                                            t113_ui_lvgl_get_height(ui));
+    return t113_ui_lvgl_present(ui, disp);
 }
 
 /* 关闭用于视频叠加的 channel=1 layer=1，避免切换模式后旧视频盖住 UI。 */
@@ -504,12 +469,13 @@ static void fill_playlist_ui(const struct media_list *list, size_t selected)
 /* 扫描 U 盘媒体并刷新播放模式列表。 */
 static int refresh_media_list_ui(struct media_list *list, size_t *selected)
 {
-    if (media_list_scan(list, USB_ROOT) == 0) { /* 重新扫描 U 盘。 */
+    if (!storage_session_lost() && *USB_ROOT && media_list_scan(list, USB_ROOT) == 0) { /* 只扫描已确认的会话。 */
         char usb_text[128];         /* U 盘状态文字。 */
 
         snprintf(usb_text, sizeof(usb_text), "USB: %s", USB_ROOT);
         t113_ui_lvgl_set_usb_status(usb_text);
     } else {
+        media_list_init(list);      /* 拔出后清空旧路径，禁止再次选择旧文件。 */
         t113_ui_lvgl_set_usb_status("USB NOT READY");
     }
 
@@ -567,7 +533,6 @@ static void still_preview_close(struct still_preview *preview)
     image_convert_close(&preview->decoder); /* 最后关闭 CedarC。 */
     memset(preview, 0, sizeof(*preview)); /* 清空状态。 */
     preview->g2d.fd = -1;           /* 恢复无效 fd。 */
-    usleep(100000);                 /* 给 ION/CedarC/disp 一点释放缓冲的时间。 */
 }
 
 /* 打开播放列表第一帧预览图层。 */
@@ -640,25 +605,32 @@ static int preview_mjpeg_first_frame(struct still_preview *preview,
     size_t frame_size;               /* 第一帧 JPEG 长度。 */
     struct yuv_image yuv;            /* CedarC 解码输出。 */
     int ret = -1;                    /* 默认失败。 */
+    unsigned int width, height;
 
     memset(&yuv, 0, sizeof(yuv));    /* 清空 YUV。 */
 
     if (!t113_ui_lvgl_get_video_rect(&video_rect)) /* 获取 UI 视频框。 */
         return -1;                  /* 获取失败。 */
-    if (still_preview_open(preview, &video_rect,
-                           DEFAULT_WIDTH, DEFAULT_HEIGHT,
-                           CEDAR_VIDEO_CODEC_MJPEG) < 0) /* 保持预览图层打开。 */
-        return -1;                  /* 打开失败。 */
     if (read_file_all(path, &file_data, &file_size) < 0) /* 读入 MJPEG 文件。 */
         return -1;                  /* 读取失败。 */
     if (!find_next_jpeg_frame(file_data, file_size, &offset,
                               &frame_data, &frame_size))
         goto out_file;              /* 没有完整 JPEG 帧。 */
 
+    if (jpeg_dimensions(frame_data, frame_size, &width, &height) < 0) /* 读取当前 JPEG 的实际 SOF 尺寸，不继承上一张照片的几何。 */
+        goto out_file;
+    /* Independent photos may change dimensions and tables; never reuse old MJPEG state. */
+    still_preview_close(preview); /* 先隐藏旧图层并回收旧尺寸缓冲，再创建新照片的硬件上下文。 */
+    if (still_preview_open(preview, &video_rect, width, height,
+                           CEDAR_VIDEO_CODEC_MJPEG) < 0)
+        goto out_file;
+
     if (image_convert_decode_mjpeg(&preview->decoder, frame_data, frame_size, &yuv) < 0)
         goto out_file;              /* 解码第一帧失败。 */
     if (g2d_display_stretch_yuv_to_dmabuf(&preview->g2d, &yuv) < 0)
         goto out_yuv;               /* G2D 转换失败。 */
+    printf("jpeg preview: %s input=%ux%u visible=%ux%u plane=%ux%u\n",
+           path, width, height, yuv.width, yuv.height, yuv.stride, yuv.buffer_height);
     if (disp_layer_display_show_argb8888(&preview->disp,
                                          g2d_display_get_dst_fd(&preview->g2d),
                                          g2d_display_get_dst_width(&preview->g2d),
@@ -671,58 +643,6 @@ out_yuv:
     image_convert_free_yuv(&yuv);   /* 释放 CedarC 输出。 */
 out_file:
     free(file_data);                /* 释放文件缓冲。 */
-    if (ret < 0)                    /* 第一帧预览失败时不能留下半开的资源。 */
-        still_preview_close(preview); /* 释放 disp/G2D/CedarC，避免后续录制 OOM。 */
-    return ret;                     /* 返回预览结果。 */
-}
-
-/* 在播放列表中高亮 MKV 文件时，用 FFmpeg 取第一包 MJPEG 做预览图。 */
-static int preview_mkv_first_frame(struct still_preview *preview,
-                                   const char *path)
-{
-    struct t113_ui_rect video_rect;  /* vedioplay 内容区域。 */
-    struct ffmpeg_mjpeg_demuxer demuxer; /* FFmpeg 解封装器。 */
-    const unsigned char *frame_data; /* 第一帧 MJPEG packet。 */
-    size_t frame_size;              /* 第一帧长度。 */
-    struct yuv_image yuv;           /* CedarC 解码输出。 */
-    int ret = -1;                   /* 默认失败。 */
-
-    memset(&demuxer, 0, sizeof(demuxer)); /* 清空解封装器。 */
-    memset(&yuv, 0, sizeof(yuv));    /* 清空 YUV。 */
-
-    if (!t113_ui_lvgl_get_video_rect(&video_rect)) /* 获取 UI 视频框。 */
-        return -1;                  /* 获取失败。 */
-    if (ffmpeg_mjpeg_demuxer_open(&demuxer, path) < 0) /* 打开 MKV。 */
-        return -1;                  /* 打开失败。 */
-    if (still_preview_open(preview, &video_rect,
-                           demuxer.width, demuxer.height,
-                           cedar_codec_from_demuxer(demuxer.codec)) < 0) /* 保持预览图层打开。 */
-        goto out_demux;             /* 打开失败。 */
-    while (ffmpeg_mjpeg_demuxer_read(&demuxer, &frame_data, &frame_size,
-                                     NULL, NULL) > 0) { /* H264/H265 可能要多喂几包才吐图。 */
-        ret = image_convert_decode_packet(&preview->decoder, frame_data, frame_size,
-                                          0, &yuv);
-        if (ret < 0)
-            goto out_demux;         /* 真正解码失败。 */
-        if (ret > 0)
-            break;                  /* 已经拿到第一帧。 */
-    }
-    if (ret <= 0)
-        goto out_demux;             /* 文件读完仍没有解码帧。 */
-    if (g2d_display_stretch_yuv_to_dmabuf(&preview->g2d, &yuv) < 0)
-        goto out_yuv;               /* G2D 转换失败。 */
-    if (disp_layer_display_show_argb8888(&preview->disp,
-                                         g2d_display_get_dst_fd(&preview->g2d),
-                                         g2d_display_get_dst_width(&preview->g2d),
-                                         g2d_display_get_dst_height(&preview->g2d)) < 0)
-        goto out_yuv;               /* 提交预览图失败。 */
-
-    ret = 0;                        /* 第一帧预览成功。 */
-
-out_yuv:
-    image_convert_free_yuv(&yuv);   /* 释放 CedarC 输出。 */
-out_demux:
-    ffmpeg_mjpeg_demuxer_close(&demuxer); /* 关闭 MKV。 */
     if (ret < 0)                    /* 第一帧预览失败时不能留下半开的资源。 */
         still_preview_close(preview); /* 释放 disp/G2D/CedarC，避免后续录制 OOM。 */
     return ret;                     /* 返回预览结果。 */
@@ -745,6 +665,7 @@ static void update_playback_selection_preview(struct disp_layer_display *ui_disp
         return;
     }
 
+    if (storage_session_lost()) return; /* 拔盘后不再访问旧列表路径。 */
     item = &list->items[selected];  /* 读取当前选中项。 */
     submit_ui_force(ui_disp, ui, last_flush); /* 先把标题/提示文字刷出来。 */
     if (item->type == MEDIA_TYPE_MJPEG ||
@@ -762,7 +683,7 @@ static void update_playback_selection_preview(struct disp_layer_display *ui_disp
          * 录制刚结束后的 AVI 文件尤其容易触发显示驱动卡死，所以第一版先禁用自动预览。
          * 真正按下播放键时仍然会进入完整播放链路。
          */
-        still_preview_close(preview);
+        still_preview_close(preview); /* 先隐藏旧图层并回收旧尺寸缓冲，再创建新照片的硬件上下文。 */
         t113_ui_lvgl_set_video_message("VIDEO");
         submit_ui_force(ui_disp, ui, last_flush);
     } else if (item->type == MEDIA_TYPE_WAV ||
@@ -826,29 +747,7 @@ out_disp:
     return -1;
 }
 
-/* 录制模式预览一帧。 */
-static int record_preview_drain_audio(struct record_preview *preview)
-{
-    struct audio_block block;        /* 当前待写入的 PCM block。 */
-    int popped;                     /* 队列弹出结果。 */
-
-    if (preview == NULL || !preview->recording)
-        return 0;                   /* 不在录制时没有音频要写。 */
-
-    while ((popped = audio_queue_try_pop(&preview->audio_queue, &block)) > 0) {
-        if (ffmpeg_mjpeg_muxer_write_audio(&preview->writer,
-                                           block.data,
-                                           block.bytes,
-                                           block.frames) < 0) {
-            audio_block_free(&block);
-            return -1;              /* 写音频失败。 */
-        }
-        audio_block_free(&block);   /* 写入后释放 PCM block。 */
-    }
-    return 0;                       /* 队列已暂时排空。 */
-}
-
-/* 录制模式预览一帧。 */
+/* 录制模式预览一帧；保存与显示消费同一采集帧。 */
 static int record_preview_step(struct record_preview *preview)
 {
     struct video_frame frame;       /* 摄像头 MJPG 帧。 */
@@ -863,23 +762,25 @@ static int record_preview_step(struct record_preview *preview)
         return -1;                  /* 取帧失败。 */
 
     if (preview->recording) {       /* 如果用户已经按下开始录制。 */
-        if (ffmpeg_mjpeg_muxer_write(&preview->writer, frame.data, frame.size) < 0) {
-            video_capture_put_frame(&preview->cap, &frame); /* 写失败也要归还 V4L2 buffer。 */
-            return -1;              /* 通知上层录制/预览异常。 */
+        if (audio_queue_is_stopped(&preview->audio_queue)) { /* 采集线程故障或会话取消时不能继续写只有视频的成功录像。 */
+            record_writer_abort(&preview->sink); /* 发布粘滞失败，让唯一写线程中止并禁止正式文件发布。 */
+            video_capture_put_frame(&preview->cap, &frame); /* 保存或复制消费完后归还驱动槽；之后禁止读取 frame.data。 */
+            return -1;
         }
-        if (record_preview_drain_audio(preview) < 0) {
+        if (record_writer_submit(&preview->sink, frame.data, frame.size, /* 把压缩 JPEG 副本和采集时间送入有界写队列，不在预览线程写盘。 */
+                                  frame.timestamp_us) < 0) { /* 队列提交失败也必须归还 V4L2 帧，并向上层报告失败。 */
             video_capture_put_frame(&preview->cap, &frame); /* 写失败也要归还 V4L2 buffer。 */
             return -1;              /* 通知上层录制/预览异常。 */
         }
     }
 
-    ret = image_convert_decode_mjpeg(&preview->decoder,
+    ret = image_convert_decode_mjpeg(&preview->decoder, /* 预览分支硬解 JPEG；保存分支直接封装原始压缩帧。 */
                                      frame.data, frame.size, &yuv);
     video_capture_put_frame(&preview->cap, &frame); /* 取出后尽快归还 V4L2 buffer。 */
     if (ret < 0)
         return -1;                  /* 解码失败。 */
 
-    ret = g2d_display_stretch_yuv_to_dmabuf(&preview->g2d, &yuv);
+    ret = g2d_display_stretch_yuv_to_dmabuf(&preview->g2d, &yuv); /* G2D 转换并缩放到独立输出页，完成后可以归还 CedarC 图像。 */
     image_convert_free_yuv(&yuv);   /* 释放 CedarC 输出帧。 */
     if (ret < 0)
         return -1;                  /* G2D 失败。 */
@@ -899,12 +800,19 @@ static int record_preview_step(struct record_preview *preview)
 static int record_preview_start_record(struct record_preview *preview,
                                        const char *record_name)
 {
+    char unique_name[128]; /* 选中 record 名称被占用时生成后缀，不覆盖已有录像。 */
     if (preview == NULL || !preview->opened)
         return -1;                  /* 必须先打开摄像头预览。 */
     if (preview->recording)
         return 0;                   /* 已经在录制就不用重复打开。 */
 
-    if (ffmpeg_mjpeg_muxer_open_av_named(&preview->writer, USB_ROOT, record_name,
+    if (storage_session_lost() || !media_storage_ready(USB_ROOT, 1))
+        return -1;                  /* 新任务不得访问失效或只读的存储会话。 */
+
+    if (media_storage_next_name(USB_ROOT, "VIDEO", record_name, "avi",
+                                unique_name, sizeof(unique_name)) < 0)
+        return -1;
+    if (ffmpeg_mjpeg_muxer_open_av_named(&preview->writer, USB_ROOT, unique_name,
                                          DEFAULT_WIDTH, DEFAULT_HEIGHT, PLAYER_FPS,
                                          AUDIO_CAPTURE_RATE,
                                          AUDIO_CAPTURE_CHANNELS,
@@ -913,17 +821,20 @@ static int record_preview_start_record(struct record_preview *preview,
                                          sizeof(preview->record_path)) < 0)
         return -1;                  /* U 盘不可用或文件打不开。 */
 
-    if (audio_queue_init(&preview->audio_queue, AUDIO_QUEUE_CAPACITY) < 0)
+    if (audio_queue_init(&preview->audio_queue, AUDIO_QUEUE_CAPACITY) < 0) /* 创建有界 PCM 队列，采集和文件写入通过它解耦。 */
         goto fail_writer;           /* 音频队列初始化失败。 */
     preview->audio_queue_ready = 1; /* 标记音频队列需要销毁。 */
+    if (record_writer_start_cancelable(&preview->sink, &preview->writer, &preview->audio_queue, /* 启动唯一封装写线程，主线程仅提交 JPEG 和停止请求。 */
+                                      g_storage_enabled ? &g_storage.cancel : NULL) < 0) /* 录制会话绑定存储粘滞取消标志，快速重插不能续写旧文件。 */
+        goto fail_audio_queue;
 
-    memset(&preview->audio_worker, 0, sizeof(preview->audio_worker));
-    preview->audio_worker.queue = &preview->audio_queue;
-    preview->audio_worker.device = AUDIO_CAPTURE_DEVICE;
-    preview->audio_worker.rate = AUDIO_CAPTURE_RATE;
-    preview->audio_worker.channels = AUDIO_CAPTURE_CHANNELS;
-    preview->audio_worker.period_frames = AUDIO_CAPTURE_PERIOD_FRAMES;
-    preview->audio_worker.ret = -1;
+    memset(&preview->audio_worker, 0, sizeof(preview->audio_worker)); /* 初始化采集统计与结果；此上下文在线程 join 前保持存活。 */
+    preview->audio_worker.queue = &preview->audio_queue; /* PCM 输出到录制写线程消费的队列。 */
+    preview->audio_worker.device = AUDIO_CAPTURE_DEVICE; /* 使用板载 codec 采集设备，不是 USB 摄像头麦克风。 */
+    preview->audio_worker.rate = AUDIO_CAPTURE_RATE; /* 采用实测稳定的 48kHz，与 AVI 音频流声明一致。 */
+    preview->audio_worker.channels = AUDIO_CAPTURE_CHANNELS; /* 实测 mono/ADC1 路径，不沿用早期三声道采集。 */
+    preview->audio_worker.period_frames = AUDIO_CAPTURE_PERIOD_FRAMES; /* 一次读取的目标样本帧数，影响采集提交粒度。 */
+    preview->audio_worker.ret = -1; /* 默认失败，只有采集线程正常退出才设置成功。 */
     if (pthread_create(&preview->audio_thread, NULL,
                        audio_capture_thread_main,
                        &preview->audio_worker) != 0) {
@@ -935,11 +846,34 @@ static int record_preview_start_record(struct record_preview *preview,
     return 0;                       /* 开始成功。 */
 
 fail_audio_queue:
-    audio_queue_destroy(&preview->audio_queue);
+    record_writer_abort(&preview->sink); /* 发布粘滞失败，让唯一写线程中止并禁止正式文件发布。 */
+    record_writer_finish(&preview->sink); /* 等待写线程退出；此后才能关闭封装器和释放 PCM 队列。 */
+    audio_queue_destroy(&preview->audio_queue); /* 采集和写线程已停止后回收残余音频块。 */
     preview->audio_queue_ready = 0;
 fail_writer:
-    ffmpeg_mjpeg_muxer_close(&preview->writer);
+    ffmpeg_mjpeg_muxer_abort(&preview->writer); /* 启动未完成，只保留临时文件。 */
+    ffmpeg_mjpeg_muxer_close(&preview->writer); /* 启动失败时清理封装资源，保留失败 .part 不发布 AVI。 */
     return -1;
+}
+
+/* 摄像头已输出 JPEG 压缩帧，拍照直接保存，不需要再次编码。 */
+static int record_preview_photo(struct record_preview *preview, const char *name)
+{
+    struct video_frame frame;
+    char path[512];
+    int ret;
+    if (!preview->opened || preview->recording ||
+        storage_session_lost() || !media_storage_ready(USB_ROOT, 1) ||
+        video_capture_get_frame(&preview->cap, &frame) < 0)
+        return -1;
+    ret = media_storage_save_jpeg_cancelable(USB_ROOT, name, frame.data, frame.size, path, sizeof(path), /* 拍照复用摄像头原始 JPEG，保存过程中检查存储取消。 */
+                                            g_storage_enabled ? &g_storage.cancel : NULL); /* 取消时不得报告保存成功。 */
+    video_capture_put_frame(&preview->cap, &frame); /* 保存或复制消费完后归还驱动槽；之后禁止读取 frame.data。 */
+    if (ret == 0)
+        printf("photo saved : %s bytes=%zu\n", path, frame.size);
+    else
+        fprintf(stderr, "photo save failed: %s\n", strerror(errno));
+    return ret;
 }
 
 /* 停止 UI 录制模式，并把文件同步到 U 盘。 */
@@ -951,25 +885,28 @@ static int record_preview_stop_record(struct record_preview *preview)
         return 0;                   /* 没在录制，无需处理。 */
 
     preview->recording = 0;         /* 先关标志，避免后续帧继续写。 */
+    if (storage_session_lost()) {   /* 拔出后不能走正常保存路径，即使旧文件仍能缓存写入。 */
+        record_writer_abort(&preview->sink); ret = -1; /* 不发布损坏的正式 AVI。 */
+    }
     if (preview->audio_started) {
         audio_queue_stop(&preview->audio_queue); /* 通知音频采集线程退出。 */
         pthread_join(preview->audio_thread, NULL); /* 等待 ALSA 采集线程收尾。 */
+        if (preview->audio_worker.ret < 0)
+            ret = -1;               /* ALSA 采集失败也必须反馈到保存结果。 */
         preview->audio_started = 0; /* 标记音频线程已结束。 */
     }
-    while (preview->audio_queue_ready) {
-        struct audio_block block;    /* 停止后队列里可能还有未写完的 PCM。 */
-        int popped = audio_queue_pop(&preview->audio_queue, &block);
-
-        if (popped <= 0)
-            break;                  /* 队列已经排空。 */
-        if (ffmpeg_mjpeg_muxer_write_audio(&preview->writer,
-                                           block.data,
-                                           block.bytes,
-                                           block.frames) < 0)
-            ret = -1;               /* 尽量继续释放后续资源。 */
-        audio_block_free(&block);   /* 释放 PCM block。 */
-    }
-    if (ffmpeg_mjpeg_muxer_close(&preview->writer) < 0) /* 写尾并 sync。 */
+    if (ret < 0)
+        record_writer_abort(&preview->sink); /* 发布粘滞失败，让唯一写线程中止并禁止正式文件发布。 */
+    if (record_writer_finish(&preview->sink) < 0) /* 正常停止要求队列排空；写线程错误必须传播给保存结果。 */
+        ret = -1;
+    if (ret < 0)
+        ffmpeg_mjpeg_muxer_abort(&preview->writer); /* 禁止正常写尾和发布，避免残缺录像混入可播放列表。 */
+    printf("record timing: video=%lldms audio=%llums capture_drift=%lldus\n",
+           (long long)preview->writer.last_pts,
+           (unsigned long long)(preview->writer.audio_frames * 1000 / AUDIO_CAPTURE_RATE),
+           (long long)(preview->audio_worker.last_sample_us - preview->audio_worker.first_sample_us -
+                        (int64_t)preview->audio_worker.captured_frames * 1000000 / AUDIO_CAPTURE_RATE));
+    if (ffmpeg_mjpeg_muxer_close(&preview->writer) < 0) /* 写尾、同步并发布 AVI。 */
         ret = -1;
     if (preview->audio_queue_ready) {
         audio_queue_destroy(&preview->audio_queue); /* 销毁音频队列。 */
@@ -1012,7 +949,7 @@ static void *mjpeg_source_thread(void *arg)
         if (!find_next_jpeg_frame(worker->data, worker->size, &offset,
                                   &frame, &frame_size))
             break;                  /* 没有更多帧。 */
-        packet = playback_packet_create(frame, frame_size, -1, -1, index);
+        packet = playback_packet_create(frame, frame_size, -1, -1, index); /* 裸 JPEG 无 PTS，创建自有数据副本供播放队列跨线程消费。 */
         if (packet == NULL) {       /* 内存不足。 */
             worker->ret = -1;       /* 记录失败。 */
             break;                  /* 退出线程。 */
@@ -1027,7 +964,7 @@ static void *mjpeg_source_thread(void *arg)
     return NULL;                    /* 线程结束。 */
 }
 
-/* MKV 读取线程：FFmpeg 只解封装 MJPEG packet，然后复制到播放队列。 */
+/* 容器读取线程：FFmpeg 解封装 MJPEG/H264/H265，复制压缩包到播放队列；不软件解码。 */
 static void *mkv_source_thread(void *arg)
 {
     struct mkv_source_worker *worker = arg; /* 线程上下文。 */
@@ -1050,7 +987,7 @@ static void *mkv_source_thread(void *arg)
             worker->ret = -1;       /* 记录错误。 */
             break;                  /* 退出线程。 */
         }
-        packet = playback_packet_create(frame, frame_size, pts_ms,
+        packet = playback_packet_create(frame, frame_size, pts_ms, /* 复制解封装借用数据并保留 PTS，下一次 read 不会覆盖此 packet。 */
                                         duration_ms, index);
         if (packet == NULL) {       /* 内存不足。 */
             worker->ret = -1;       /* 记录失败。 */
@@ -1066,34 +1003,21 @@ static void *mkv_source_thread(void *arg)
     return NULL;                    /* 线程结束。 */
 }
 
-/* AVI 音频线程：独立打开同一个 AVI，只取 PCM S16_LE 音频包送 ALSA。 */
+/* 容器音频线程：独立解封装并解码音轨，转换 PCM 送 ALSA，再发布硬件消费时钟。 */
 static void *avi_audio_thread(void *arg)
 {
     struct avi_audio_worker *worker = arg; /* 线程上下文。 */
 
-    worker->ret = ffmpeg_audio_play(worker->path,
+    worker->ret = ffmpeg_audio_play_clock(worker->path,
                                     AUDIO_CAPTURE_DEVICE,
                                     worker->stop,
                                     worker->paused,
                                     NULL,
-                                    NULL); /* 容器音频进度由视频 PTS 驱动。 */
+                                    NULL, worker->clock);
+    __atomic_store_n(&worker->done, 1, __ATOMIC_RELEASE); /* 先写结果再发布 done，读取线程 acquire 后才可以访问 ret。 */
     return NULL;
 }
 
-/* WAV 播放线程：播放 PCM S16_LE WAV，并在结束时通知主线程。 */
-static void *wav_play_thread(void *arg)
-{
-    struct wav_play_worker *worker = arg; /* 线程上下文。 */
-
-    worker->ret = wav_player_play_pcm16(worker->path,
-                                        AUDIO_CAPTURE_DEVICE,
-                                        &worker->stop,
-                                        &worker->paused,
-                                        wav_progress_cb,
-                                        worker);
-    worker->done = 1;               /* 标记播放线程已退出。 */
-    return NULL;
-}
 
 /* FFmpeg 音频播放线程：播放 AAC/MP3 等压缩音频。 */
 static void *ffmpeg_audio_play_thread(void *arg)
@@ -1106,7 +1030,7 @@ static void *ffmpeg_audio_play_thread(void *arg)
                                     &worker->paused,
                                     wav_progress_cb,
                                     worker);
-    worker->done = 1;               /* 标记播放线程已退出。 */
+    __atomic_store_n(&worker->done, 1, __ATOMIC_RELEASE); /* 先写结果再发布 done，读取线程 acquire 后才可以访问 ret。 */
     return NULL;
 }
 
@@ -1123,14 +1047,16 @@ static enum playback_result play_ffmpeg_audio_on_current_ui(struct disp_layer_di
     int thread_started = 0;         /* 线程是否已启动。 */
     enum playback_result ret = PLAYBACK_RESULT_ERROR; /* 默认失败。 */
 
-    if (ffmpeg_audio_probe(path, &info) < 0) {
+    memset(&worker, 0, sizeof(worker)); /* 绑定前初始化停止标志，不得覆盖监控线程发出的取消。 */
+    storage_bind_task(&worker.stop); /* 即使阻塞在探测阶段也能收到拔盘通知。 */
+    if (ffmpeg_audio_probe_interruptible(path, &info, &worker.stop) < 0) {
+        storage_bind_task(NULL);    /* 所有返回路径必须解绑栈上的停止标志。 */
         t113_ui_lvgl_set_audio_visualizer(false);
         t113_ui_lvgl_set_video_message("NO SUPPORT");
         submit_ui_force(ui_disp, ui, last_flush);
         return PLAYBACK_RESULT_ERROR;
     }
 
-    memset(&worker, 0, sizeof(worker));
     worker.path = path;
     worker.total_ms = info.duration_ms > 0 ? (uint32_t)info.duration_ms : 1U;
     t113_ui_lvgl_set_video_message("");
@@ -1141,44 +1067,52 @@ static enum playback_result play_ffmpeg_audio_on_current_ui(struct disp_layer_di
 
     if (pthread_create(&thread, NULL, ffmpeg_audio_play_thread, &worker) != 0) {
         perror("pthread_create ffmpeg audio");
+        storage_bind_task(NULL);    /* 创建失败也不能留下悬空绑定。 */
         return PLAYBACK_RESULT_ERROR;
     }
     thread_started = 1;
 
-    while (!g_stop && !worker.done) {
+    while (!g_stop && !storage_session_lost() && !__atomic_load_n(&worker.done, __ATOMIC_ACQUIRE)) {
         if (input != NULL && input->fd >= 0) {
             struct app_key_event event;
 
             if (input_key_poll(input, &event) > 0) {
                 if (event.key == APP_KEY_BACK &&
                     event.action == APP_KEY_ACTION_SHORT) {
-                    worker.paused = !worker.paused;
+                    __atomic_store_n(&worker.paused, !__atomic_load_n(&worker.paused, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
                     t113_ui_lvgl_set_playing(!worker.paused);
                     submit_ui_force(ui_disp, ui, last_flush);
                 } else if (event.key == APP_KEY_NEXT &&
                            event.action == APP_KEY_ACTION_SHORT) {
                     ret = PLAYBACK_RESULT_NEXT;
-                    worker.stop = 1;
+                    __atomic_store_n(&worker.stop, 1, __ATOMIC_RELEASE); /* 请求音频线程退出，不从控制线程关闭它持有的 ALSA 句柄。 */
                     break;
                 } else if (event.key == APP_KEY_ENTER &&
                            event.action == APP_KEY_ACTION_SHORT) {
                     ret = PLAYBACK_RESULT_PREV;
-                    worker.stop = 1;
+                    __atomic_store_n(&worker.stop, 1, __ATOMIC_RELEASE); /* 请求音频线程退出，不从控制线程关闭它持有的 ALSA 句柄。 */
+                    break;
+                } else if (event.key == APP_KEY_BACK && event.action == APP_KEY_ACTION_LONG) {
+                    ret = PLAYBACK_RESULT_RECORD;
                     break;
                 }
             }
         }
 
-        set_playback_progress_ms(worker.played_ms, worker.total_ms);
+        set_playback_progress_ms(__atomic_load_n(&worker.played_ms, __ATOMIC_ACQUIRE),
+                                 __atomic_load_n(&worker.total_ms, __ATOMIC_ACQUIRE));
         submit_ui_if_dirty(ui_disp, ui, last_flush);
         usleep(10000);
     }
 
+    __atomic_store_n(&worker.stop, 1, __ATOMIC_RELEASE); /* 请求音频线程退出，不从控制线程关闭它持有的 ALSA 句柄。 */
+    if (thread_started)
+        pthread_join(thread, NULL); /* 等待音频任务完全退出，再释放栈上的 worker 和解除会话绑定。 */
+    storage_bind_task(NULL);        /* join 后解绑，监控不再访问 worker。 */
+    if (storage_session_lost()) ret = PLAYBACK_RESULT_STORAGE_LOST; /* 与正常 EOF 明确区分。 */
+    /* join 后才能读取线程返回值，包括 Ctrl+C 提前退出的路径。 */
     if (ret == PLAYBACK_RESULT_ERROR)
         ret = worker.ret == 0 ? PLAYBACK_RESULT_END : PLAYBACK_RESULT_ERROR;
-    worker.stop = 1;
-    if (thread_started)
-        pthread_join(thread, NULL);
     t113_ui_lvgl_set_audio_visualizer(false);
     t113_ui_lvgl_set_video_message("");
     submit_ui_force(ui_disp, ui, last_flush);
@@ -1186,82 +1120,6 @@ static enum playback_result play_ffmpeg_audio_on_current_ui(struct disp_layer_di
 }
 
 /* 在已经打开的 LVGL UI 上播放 WAV。 */
-static enum playback_result play_wav_on_current_ui(struct disp_layer_display *ui_disp,
-                                                   struct t113_ui_lvgl *ui,
-                                                   struct input_key *input,
-                                                   const char *path,
-                                                   uint32_t *last_flush)
-{
-    struct wav_player info;         /* WAV 文件信息。 */
-    struct wav_play_worker worker;  /* WAV 播放线程参数。 */
-    pthread_t thread;               /* WAV 播放线程。 */
-    int thread_started = 0;         /* 线程是否已启动。 */
-    enum playback_result ret = PLAYBACK_RESULT_ERROR; /* 默认失败。 */
-
-    if (wav_player_probe(path, &info) < 0) {
-        t113_ui_lvgl_set_audio_visualizer(false);
-        t113_ui_lvgl_set_video_message("NO SUPPORT");
-        submit_ui_force(ui_disp, ui, last_flush);
-        return PLAYBACK_RESULT_ERROR;
-    }
-
-    memset(&worker, 0, sizeof(worker));
-    worker.path = path;
-    worker.total_ms = (uint32_t)(((uint64_t)info.data_size * 1000ULL) /
-                                 ((uint64_t)info.sample_rate *
-                                  info.channels *
-                                  (info.bits_per_sample / 8U)));
-    t113_ui_lvgl_set_video_message("");
-    t113_ui_lvgl_set_audio_visualizer(true);
-    t113_ui_lvgl_set_fps(0);
-    set_playback_progress_ms(0, worker.total_ms);
-    submit_ui_force(ui_disp, ui, last_flush);
-
-    if (pthread_create(&thread, NULL, wav_play_thread, &worker) != 0) {
-        perror("pthread_create wav play");
-        return PLAYBACK_RESULT_ERROR;
-    }
-    thread_started = 1;
-
-    while (!g_stop && !worker.done) {
-        if (input != NULL && input->fd >= 0) {
-            struct app_key_event event;
-
-            if (input_key_poll(input, &event) > 0) {
-                if (event.key == APP_KEY_BACK &&
-                    event.action == APP_KEY_ACTION_SHORT) {
-                    worker.paused = !worker.paused;
-                    t113_ui_lvgl_set_playing(!worker.paused);
-                    submit_ui_force(ui_disp, ui, last_flush);
-                } else if (event.key == APP_KEY_NEXT &&
-                           event.action == APP_KEY_ACTION_SHORT) {
-                    ret = PLAYBACK_RESULT_NEXT;
-                    worker.stop = 1;
-                    break;
-                } else if (event.key == APP_KEY_ENTER &&
-                           event.action == APP_KEY_ACTION_SHORT) {
-                    ret = PLAYBACK_RESULT_PREV;
-                    worker.stop = 1;
-                    break;
-                }
-            }
-        }
-
-        set_playback_progress_ms(worker.played_ms, worker.total_ms);
-        submit_ui_if_dirty(ui_disp, ui, last_flush);
-        usleep(10000);
-    }
-
-    if (ret == PLAYBACK_RESULT_ERROR)
-        ret = worker.ret == 0 ? PLAYBACK_RESULT_END : PLAYBACK_RESULT_ERROR;
-    worker.stop = 1;
-    if (thread_started)
-        pthread_join(thread, NULL);
-    t113_ui_lvgl_set_audio_visualizer(false);
-    t113_ui_lvgl_set_video_message("");
-    submit_ui_force(ui_disp, ui, last_flush);
-    return ret;
-}
 
 /* 在已经打开的 LVGL UI 上播放一个 MJPEG 裸流文件。 */
 static enum playback_result play_mjpeg_on_current_ui(struct disp_layer_display *ui_disp,
@@ -1341,7 +1199,7 @@ static enum playback_result play_mjpeg_on_current_ui(struct disp_layer_display *
     }
     source_started = 1;             /* 标记线程已启动。 */
 
-    while (!g_stop) {               /* 播放到文件结束或 Ctrl+C。 */
+    while (!g_stop && !storage_session_lost()) { /* 拔盘时即使裸流已全部读入内存也停止显示。 */
         struct playback_packet *packet; /* 当前待显示 packet。 */
         struct yuv_image yuv;       /* CedarC 解码输出。 */
 
@@ -1366,6 +1224,9 @@ static enum playback_result play_mjpeg_on_current_ui(struct disp_layer_display *
                 } else if (event.key == APP_KEY_ENTER &&
                            event.action == APP_KEY_ACTION_SHORT) {
                     ret = PLAYBACK_RESULT_PREV; /* 左键：停止当前播放，回主循环切上一项。 */
+                    goto out_decoder;
+                } else if (event.key == APP_KEY_BACK && event.action == APP_KEY_ACTION_LONG) {
+                    ret = PLAYBACK_RESULT_RECORD;
                     goto out_decoder;
                 }
             }
@@ -1411,7 +1272,7 @@ static enum playback_result play_mjpeg_on_current_ui(struct disp_layer_display *
         playback_packet_free(packet); /* 释放当前 packet。 */
     }
 
-    ret = PLAYBACK_RESULT_END;      /* 播放完成。 */
+    ret = storage_session_lost() ? PLAYBACK_RESULT_STORAGE_LOST : PLAYBACK_RESULT_END; /* 拔盘不是正常 EOF。 */
 
 out_decoder:
     playback_queue_stop(&queue);    /* 通知读取线程退出。 */
@@ -1451,8 +1312,19 @@ static enum playback_result play_mkv_on_current_ui(struct disp_layer_display *ui
     pthread_t source_thread;        /* MKV 解封装线程。 */
     struct avi_audio_worker audio_worker; /* AVI PCM 音频播放线程上下文。 */
     pthread_t audio_thread;         /* AVI PCM 音频播放线程。 */
+    struct media_clock audio_clock; /* 音频实际消费位置的主时钟，避免视频按读包速度显示。 */
+    struct ffmpeg_audio_info audio_info;
+    struct yuv_image pending_yuv = {0}; /* 持有一张已解码待显示图，生命周期跨越多次调度循环。 */
+    int have_yuv = 0; /* 记录是否拥有待归还的 CedarC 输出。 */
+    int video_eof = 0; /* 解封装 EOF 后还需排出解码器缓存，不能立即宣告播放结束。 */
+    int clock_ready = 0; /* 记录时钟锁初始化是否成功，错误出口据此销毁。 */
+    int64_t pending_due_ms = 0; /* 待显示图像的媒体 PTS，而非当前线程运行时间。 */
+    int64_t pause_start_ms = 0; /* 无音频时用于扣除暂停期间的墙钟经过时间。 */
+    unsigned int dropped = 0; /* 统计丢弃的过时输出图像，不是丢压缩参考帧。 */
+    int64_t last_report_ms = 0;
+    int64_t max_display_error_ms = 0; /* 记录 VSYNC 显示后相对主时钟的最大落后。 */
+    int timing_log = getenv("AV_TIMING") != NULL; /* 详细时间诊断按需启用，默认不刷每帧日志。 */
     struct timespec schedule_start; /* 绝对时间调度起点。 */
-    int64_t last_due_ms = 0;         /* 最近一帧的目标播放时间，用于暂停恢复。 */
     unsigned int frames = 0;         /* 已播放帧数。 */
     struct fps_meter fps;            /* 实际播放帧率统计。 */
     int paused = 0;                  /* 播放暂停状态。 */
@@ -1474,12 +1346,16 @@ static enum playback_result play_mkv_on_current_ui(struct disp_layer_display *ui
         fprintf(stderr, "playback queue init failed\n");
         return PLAYBACK_RESULT_ERROR;
     }
+    if (media_clock_init(&audio_clock) != 0) /* 线程启动前创建时钟同步锁。 */
+        goto out_queue;
+    clock_ready = 1;
+    storage_bind_task(&audio_stop); /* 同一个停止标志取消音频和容器读取任务。 */
 
     if (!t113_ui_lvgl_get_video_rect(&video_rect)) { /* 获取显示区域。 */
         fprintf(stderr, "get UI video rect failed\n");
         goto out_queue;
     }
-    if (ffmpeg_mjpeg_demuxer_open(&demuxer, path) < 0) /* 打开 MKV。 */
+    if (ffmpeg_mjpeg_demuxer_open_interruptible(&demuxer, path, &audio_stop) < 0)
         goto out_queue;
 
     t113_ui_lvgl_set_audio_visualizer(false);
@@ -1519,14 +1395,19 @@ static enum playback_result play_mkv_on_current_ui(struct disp_layer_display *ui
     source_started = 1;             /* 标记线程已启动。 */
 
     audio_worker.path = path;       /* 同一个容器文件单独打开一遍取音频。 */
-    audio_worker.stop = &audio_stop;
-    audio_worker.paused = &audio_paused;
-    if (pthread_create(&audio_thread, NULL, avi_audio_thread, &audio_worker) == 0)
-        audio_started = 1;          /* 没有音频流时线程会很快退出。 */
+    audio_worker.stop = &audio_stop; /* 音频播放和 FFmpeg 视频读取共用会话停止信号。 */
+    audio_worker.paused = &audio_paused; /* 音频线程按同一暂停状态停止提交声音。 */
+    audio_worker.clock = &audio_clock; /* 仅发布时钟，不把 ALSA 句柄交给视频线程。 */
+    if (ffmpeg_audio_probe_interruptible(path, &audio_info, &audio_stop) == 0) {
+        if (pthread_create(&audio_thread, NULL, avi_audio_thread, &audio_worker) != 0)
+            goto out_decoder;
+        audio_started = 1;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &schedule_start);
 
-    while (!g_stop) {               /* 播放到文件结束或 Ctrl+C。 */
-        struct playback_packet *packet; /* 当前待显示 packet。 */
-        struct yuv_image yuv;       /* CedarC 解码输出。 */
+    while (!g_stop && !storage_session_lost()) { /* 暂停时也检测粘滞取消，不恢复旧会话。 */
+        struct playback_packet *packet = NULL;
+        int64_t position_ms;
 
         if (input != NULL && input->fd >= 0) { /* 播放中继续响应实体按键。 */
             struct app_key_event event; /* 播放过程中的按键事件。 */
@@ -1535,12 +1416,13 @@ static enum playback_result play_mkv_on_current_ui(struct disp_layer_display *ui
                 if (event.key == APP_KEY_BACK &&
                     event.action == APP_KEY_ACTION_SHORT) {
                     paused = !paused; /* 中键短按：播放/暂停切换。 */
-                    audio_paused = paused; /* 音频线程跟随暂停状态。 */
-                    if (!paused) {  /* 从暂停恢复播放。 */
-                        clock_gettime(CLOCK_MONOTONIC, &schedule_start);
-                        schedule_start = timespec_sub_ms(schedule_start,
-                                                         last_due_ms);
-                    }
+                    __atomic_store_n(&audio_paused, paused, __ATOMIC_RELEASE); /* 短按切换时同步暂停音频，避免只冻结视频。 */
+                    media_clock_pause(&audio_clock, paused); /* 暂停共享媒体时钟。 */
+                    if (paused)
+                        pause_start_ms = media_monotonic_ms(); /* 记录暂停开始时刻。 */
+                    else
+                        schedule_start = timespec_add_ms(schedule_start,
+                                                          media_monotonic_ms() - pause_start_ms); /* 无音频恢复时把暂停耗时加到调度起点，避免所有帧突然过期。 */
                     t113_ui_lvgl_set_playing(!paused); /* 图标随状态变化。 */
                     submit_ui_force(ui_disp, ui, last_flush); /* 立刻刷新按钮图标。 */
                 } else if (event.key == APP_KEY_NEXT &&
@@ -1550,6 +1432,9 @@ static enum playback_result play_mkv_on_current_ui(struct disp_layer_display *ui
                 } else if (event.key == APP_KEY_ENTER &&
                            event.action == APP_KEY_ACTION_SHORT) {
                     ret = PLAYBACK_RESULT_PREV; /* 左键切上一项。 */
+                    goto out_decoder;
+                } else if (event.key == APP_KEY_BACK && event.action == APP_KEY_ACTION_LONG) {
+                    ret = PLAYBACK_RESULT_RECORD;
                     goto out_decoder;
                 }
             }
@@ -1561,56 +1446,118 @@ static enum playback_result play_mkv_on_current_ui(struct disp_layer_display *ui
             continue;               /* 等按键恢复播放。 */
         }
 
-        if (playback_queue_pop(&queue, &packet) == 0) /* 队列结束。 */
-            break;                  /* 正常结束或被打断。 */
-
-        memset(&yuv, 0, sizeof(yuv)); /* 清空输出结构。 */
-        decode_ret = image_convert_decode_packet(&decoder, packet->data, packet->size,
-                                                 packet->pts_ms, &yuv);
-        if (decode_ret < 0) {
-            playback_packet_free(packet);
-            goto out_decoder;       /* CedarC 解码失败。 */
-        }
-        if (decode_ret == 0) {      /* H264/H265 可能因为 B 帧重排序暂时不吐图。 */
-            playback_packet_free(packet);
-            continue;               /* 继续喂下一包，直到 CedarC 输出图像。 */
-        }
-        if (g2d_display_stretch_yuv_to_dmabuf(&g2d, &yuv) < 0) { /* G2D 转换。 */
-            image_convert_free_yuv(&yuv);
-            playback_packet_free(packet);
+        if (audio_started && __atomic_load_n(&audio_worker.done, __ATOMIC_ACQUIRE) && audio_worker.ret < 0) /* 音频任务错误不能被视频继续播放掩盖。 */
             goto out_decoder;
+        if (!have_yuv && !video_eof) { /* 尚无待显示画面时才消费下一包。 */
+            int popped = playback_queue_try_pop(&queue, &packet); /* 非阻塞取包，让按键、存储和界面仍能得到调度。 */
+            if (popped == 0) {
+                usleep(5000);
+                continue;
+            }
+            if (popped < 0) {
+                if (source.ret < 0)
+                    goto out_decoder;
+                decode_ret = image_convert_drain(&decoder, &pending_yuv); /* 读包 EOF 后排出 H264/H265 的重排序尾帧。 */
+                if (decode_ret < 0)
+                    goto out_decoder;
+                if (decode_ret == 0)
+                    video_eof = 1; /* 只有解码器也已排空才标记视频彻底结束。 */
+                else {
+                    pending_due_ms = pending_yuv.pts_ms; /* 尾帧使用解码器返回的显示时间戳。 */
+                    have_yuv = 1; /* 当前输出图由调度循环持有，显示或丢弃后必须归还。 */
+                }
+                continue;
+            }
+            decode_ret = image_convert_decode_packet(&decoder, packet->data, packet->size,
+                                                     packet->pts_ms, &pending_yuv);
+            if (decode_ret < 0) {
+                playback_packet_free(packet);
+                goto out_decoder;       /* CedarC 解码失败。 */
+            }
+            if (decode_ret == 0) {      /* H264/H265 可能因为 B 帧重排序暂时不吐图。 */
+                playback_packet_free(packet);
+                continue;               /* 继续喂下一包，直到 CedarC 输出图像。 */
+            }
+            pending_due_ms = pending_yuv.pts_ms >= 0 ? pending_yuv.pts_ms :
+                             playback_due_ms(packet->index, packet->pts_ms);
+            playback_packet_free(packet);
+            have_yuv = 1; /* 当前输出图由调度循环持有，显示或丢弃后必须归还。 */
         }
-        image_convert_free_yuv(&yuv); /* 释放解码输出。 */
-
-        if (frames == 0)            /* 首帧前启动显示调度，避免初始化耗时导致追帧。 */
-            clock_gettime(CLOCK_MONOTONIC, &schedule_start);
-        sleep_until_monotonic(timespec_add_ms(schedule_start,
-                              container_video_due_ms(frames))); /* H264/H265 输出有重排序，显示节奏按已显示帧数走。 */
-        last_due_ms = container_video_due_ms(frames);
+        if (audio_started) {
+            if (!media_clock_read(&audio_clock, &position_ms)) { /* 有音频时等待真实消费时钟就绪，不以视频线程速度代替。 */
+                if (__atomic_load_n(&audio_worker.done, __ATOMIC_ACQUIRE))
+                    goto out_decoder;
+                usleep(5000);
+                continue;
+            }
+        } else {
+            position_ms = media_monotonic_ms() - /* 无音频时使用单调时间减播放起点作为备用时钟。 */
+                          ((int64_t)schedule_start.tv_sec * 1000 + schedule_start.tv_nsec / 1000000);
+        }
+        set_playback_progress_ms(position_ms, demuxer.duration_ms);
+        if (!have_yuv) {
+            if (video_eof && (!audio_started || __atomic_load_n(&audio_worker.done, __ATOMIC_ACQUIRE)))
+                break;
+            submit_ui_if_dirty(ui_disp, ui, last_flush);
+            usleep(5000);
+            continue;
+        }
+        if (pending_due_ms > position_ms + 5) { /* 画面尚未到显示时刻，保留输出图并短暂等待。 */
+            submit_ui_if_dirty(ui_disp, ui, last_flush);
+            usleep(5000);
+            continue;
+        }
+        /* H264/H265 仍逐包解码以保留参考帧，只丢已解码的过时画面。 */
+        if (position_ms - pending_due_ms > 100 && frames > 0) { /* 落后超过 100ms 时跳过过时画面，不牺牲解码器参考帧。 */
+            image_convert_free_yuv(&pending_yuv); /* G2D 已完成消费或决定丢帧后归还解码输出。 */
+            have_yuv = 0; /* 清除所有权标记，错误出口不能重复归还。 */
+            dropped++; /* 记录被调度丢弃的解码后画面。 */
+            continue;
+        }
+        if (g2d_display_stretch_yuv_to_dmabuf(&g2d, &pending_yuv) < 0)
+            goto out_decoder;
+        image_convert_free_yuv(&pending_yuv); /* G2D 已完成消费或决定丢帧后归还解码输出。 */
+        have_yuv = 0; /* 清除所有权标记，错误出口不能重复归还。 */
         if (disp_layer_display_show_argb8888(&video_disp,
                                              g2d_display_get_dst_fd(&g2d),
                                              g2d_display_get_dst_width(&g2d),
                                              g2d_display_get_dst_height(&g2d)) < 0)
         {
-            playback_packet_free(packet);
             goto out_decoder;       /* 提交视频层失败。 */
         }
         frames++;                   /* 统计帧数。 */
         fps_meter_frame(&fps);      /* 每秒刷新一次 FPS 标签。 */
-        set_playback_progress_ms(packet->pts_ms, demuxer.duration_ms); /* 用容器 PTS 更新进度。 */
+        {
+            int64_t shown_ms = position_ms;
+            int64_t error;
+            if (audio_started)
+                media_clock_read(&audio_clock, &shown_ms);
+            error = shown_ms - pending_due_ms; /* 显示完成时的主时钟减图像 PTS，正值表示画面落后。 */
+            if (error > max_display_error_ms)
+                max_display_error_ms = error;
+            if (timing_log && shown_ms - last_report_ms >= 5000) { /* 可选同步诊断最多每五秒输出一次。 */
+                printf("av clock: audio=%lld video=%lld skew=%lldms frames=%u drop=%u\n",
+                       (long long)shown_ms, (long long)pending_due_ms, (long long)error, frames, dropped);
+                fflush(stdout);
+                last_report_ms = shown_ms;
+            }
+        }
         submit_ui_if_dirty(ui_disp, ui, last_flush); /* 播放时仍刷新 UI。 */
-        playback_packet_free(packet); /* 释放当前 packet。 */
     }
 
-    ret = PLAYBACK_RESULT_END;      /* 播放完成。 */
+    ret = storage_session_lost() ? PLAYBACK_RESULT_STORAGE_LOST : PLAYBACK_RESULT_END; /* 容器任务同样区分取消与 EOF。 */
 
 out_decoder:
-    audio_stop = 1;                 /* 先要求音频线程退出。 */
+    __atomic_store_n(&audio_stop, 1, __ATOMIC_RELEASE); /* 所有切换与错误出口先请求停止，不销毁运行中的资源。 */
+    playback_queue_stop(&queue);    /* 同时唤醒读线程，避免切换时仍向旧队列投递。 */
     if (audio_started)              /* 等 ALSA 播放线程释放设备。 */
-        pthread_join(audio_thread, NULL);
-    playback_queue_stop(&queue);    /* 通知解封装线程退出。 */
+        pthread_join(audio_thread, NULL); /* 等待音频设备与读文件句柄归属线程自行释放。 */
     if (source_started)             /* 如果线程已经启动。 */
         pthread_join(source_thread, NULL); /* 等待线程退出。 */
+    if (have_yuv)
+        image_convert_free_yuv(&pending_yuv); /* G2D 已完成消费或决定丢帧后归还解码输出。 */
+    printf("playback timing: displayed=%u late_drop=%u max_display_late=%lldms result=%d\n",
+           frames, dropped, (long long)max_display_error_ms, ret);
     disp_layer_display_close(&video_disp); /* 先隐藏视频层，避免继续扫描 G2D dmabuf。 */
     g2d_display_close(&g2d);        /* 再关闭 G2D。 */
     image_convert_close(&decoder);  /* 最后关闭 CedarC。 */
@@ -1624,8 +1571,11 @@ out_video_disp:
 out_demux:
     ffmpeg_mjpeg_demuxer_close(&demuxer); /* 关闭 MKV。 */
 out_queue:
+    storage_bind_task(NULL);        /* 包含初始化失败路径；解绑完成后才能返回栈上下文。 */
     playback_queue_destroy(&queue); /* 销毁播放队列。 */
     printf("ui mkv frames: %u\n", frames); /* 打印播放帧数。 */
+    if (clock_ready)
+        media_clock_destroy(&audio_clock); /* 所有读写时钟的线程退出后再销毁锁。 */
     return ret;                     /* 返回结果。 */
 }
 
@@ -1656,10 +1606,7 @@ static int run_ui(void)
                video_rect.x, video_rect.y, video_rect.w, video_rect.h);
     }
 
-    if (disp_layer_display_show_argb8888(&disp,
-                                         t113_ui_lvgl_get_dmabuf_fd(&ui),
-                                         t113_ui_lvgl_get_width(&ui),
-                                         t113_ui_lvgl_get_height(&ui)) < 0)
+    if (t113_ui_lvgl_present(&ui, &disp) < 0)
         goto out_ui;                /* 首帧显示失败。 */
 
     last_flush = t113_ui_lvgl_get_flush_count(&ui); /* 记录首帧 flush 次数。 */
@@ -1680,10 +1627,7 @@ static int run_ui(void)
         flush_now = t113_ui_lvgl_get_flush_count(&ui); /* 读取刷新计数。 */
         if (flush_now != last_flush) { /* 有新画面才重新提交图层配置。 */
             last_flush = flush_now; /* 更新已提交计数。 */
-            if (disp_layer_display_show_argb8888(&disp,
-                                                 t113_ui_lvgl_get_dmabuf_fd(&ui),
-                                                 t113_ui_lvgl_get_width(&ui),
-                                                 t113_ui_lvgl_get_height(&ui)) < 0)
+            if (t113_ui_lvgl_present(&ui, &disp) < 0)
                 goto out_ui;        /* 提交失败则退出。 */
         }
 
@@ -1694,6 +1638,7 @@ static int run_ui(void)
 
 out_ui:
     printf("ui flushes  : %u\n", t113_ui_lvgl_get_flush_count(&ui));
+    disp_layer_display_hide(&disp);
     t113_ui_lvgl_close(&ui);        /* 释放 LVGL ION 缓冲。 */
 out_disp:
     disp_layer_display_close(&disp);/* 关闭显示图层。 */
@@ -1726,10 +1671,7 @@ static int run_ui_mkv_video(const char *path)
     t113_ui_lvgl_set_screen_title("T113Camera"); /* 设置标题。 */
     t113_ui_lvgl_set_title("VIDEO", path); /* 显示当前文件。 */
     t113_ui_lvgl_set_playing(true); /* 播放图标切成暂停态。 */
-    if (disp_layer_display_show_argb8888(&ui_disp,
-                                         t113_ui_lvgl_get_dmabuf_fd(&ui),
-                                         t113_ui_lvgl_get_width(&ui),
-                                         t113_ui_lvgl_get_height(&ui)) < 0)
+    if (t113_ui_lvgl_present(&ui, &ui_disp) < 0)
         goto out_ui;                /* 首帧 UI 显示失败。 */
     last_flush = t113_ui_lvgl_get_flush_count(&ui); /* 记录首帧。 */
 
@@ -1741,6 +1683,7 @@ static int run_ui_mkv_video(const char *path)
 out_ui:
     hide_video_overlay_layer();     /* 退出命令行测试时隐藏视频层。 */
     t113_ui_lvgl_set_playing(false);/* 图标恢复播放态。 */
+    disp_layer_display_hide(&ui_disp);
     t113_ui_lvgl_close(&ui);        /* 释放 LVGL。 */
 out_disp:
     disp_layer_display_close(&ui_disp); /* 关闭 UI 图层。 */
@@ -1773,20 +1716,18 @@ static int run_ui_wav(const char *path)
     t113_ui_lvgl_set_screen_title("T113Camera"); /* 设置标题。 */
     t113_ui_lvgl_set_title("WAV", path); /* 显示当前文件。 */
     t113_ui_lvgl_set_playing(true); /* 播放图标切成暂停态。 */
-    if (disp_layer_display_show_argb8888(&ui_disp,
-                                         t113_ui_lvgl_get_dmabuf_fd(&ui),
-                                         t113_ui_lvgl_get_width(&ui),
-                                         t113_ui_lvgl_get_height(&ui)) < 0)
+    if (t113_ui_lvgl_present(&ui, &ui_disp) < 0)
         goto out_ui;                /* 首帧 UI 显示失败。 */
     last_flush = t113_ui_lvgl_get_flush_count(&ui); /* 记录首帧。 */
 
-    play_result = play_wav_on_current_ui(&ui_disp, &ui, NULL,
+    play_result = play_ffmpeg_audio_on_current_ui(&ui_disp, &ui, NULL,
                                          path, &last_flush); /* 播放 WAV。 */
     if (play_result == PLAYBACK_RESULT_END)
         ret = 0;                    /* 播放到结束视为成功。 */
 
 out_ui:
     t113_ui_lvgl_set_playing(false);/* 图标恢复播放态。 */
+    disp_layer_display_hide(&ui_disp);
     t113_ui_lvgl_close(&ui);        /* 释放 LVGL。 */
 out_disp:
     disp_layer_display_close(&ui_disp); /* 关闭 UI 图层。 */
@@ -1819,10 +1760,7 @@ static int run_ui_ffmpeg_audio(const char *path)
     t113_ui_lvgl_set_screen_title("T113Camera"); /* 设置标题。 */
     t113_ui_lvgl_set_title("AUDIO", path); /* 显示当前文件。 */
     t113_ui_lvgl_set_playing(true); /* 播放图标切成暂停态。 */
-    if (disp_layer_display_show_argb8888(&ui_disp,
-                                         t113_ui_lvgl_get_dmabuf_fd(&ui),
-                                         t113_ui_lvgl_get_width(&ui),
-                                         t113_ui_lvgl_get_height(&ui)) < 0)
+    if (t113_ui_lvgl_present(&ui, &ui_disp) < 0)
         goto out_ui;                /* 首帧 UI 显示失败。 */
     last_flush = t113_ui_lvgl_get_flush_count(&ui); /* 记录首帧。 */
 
@@ -1833,6 +1771,7 @@ static int run_ui_ffmpeg_audio(const char *path)
 
 out_ui:
     t113_ui_lvgl_set_playing(false);/* 图标恢复播放态。 */
+    disp_layer_display_hide(&ui_disp);
     t113_ui_lvgl_close(&ui);        /* 释放 LVGL。 */
 out_disp:
     disp_layer_display_close(&ui_disp); /* 关闭 UI 图层。 */
@@ -1853,6 +1792,7 @@ static int run_ui_video(const char *path)
     size_t offset = 0;               /* 当前解析偏移。 */
     unsigned int frames = 0;         /* 已播放帧数。 */
     unsigned int total_frames = 0;   /* 文件总帧数，用于计算进度。 */
+    unsigned int src_width, src_height;
     uint32_t last_flush = 0;         /* UI 上次提交的 flush 计数。 */
     int ret = -1;                    /* 默认失败。 */
 
@@ -1868,6 +1808,8 @@ static int run_ui_video(const char *path)
     if (read_file_all(path, &file_data, &file_size) < 0) /* 读取 MJPEG 文件。 */
         return -1;                  /* 读取失败。 */
     printf("ui video    : %s bytes=%lu\n", path, (unsigned long)file_size);
+    if (jpeg_dimensions(file_data, file_size, &src_width, &src_height) < 0)
+        goto out_file;
     total_frames = count_mjpeg_frames(file_data, file_size); /* 统计完整 JPEG 帧。 */
     if (total_frames == 0U) {       /* 没有可播放帧。 */
         fprintf(stderr, "no jpeg frame found in %s\n", path);
@@ -1889,10 +1831,7 @@ static int run_ui_video(const char *path)
     printf("ui video rect: x=%d y=%d w=%d h=%d\n",
            video_rect.x, video_rect.y, video_rect.w, video_rect.h);
 
-    if (disp_layer_display_show_argb8888(&ui_disp,
-                                         t113_ui_lvgl_get_dmabuf_fd(&ui),
-                                         t113_ui_lvgl_get_width(&ui),
-                                         t113_ui_lvgl_get_height(&ui)) < 0)
+    if (t113_ui_lvgl_present(&ui, &ui_disp) < 0)
         goto out_ui;                /* 显示 UI 首帧失败。 */
     last_flush = t113_ui_lvgl_get_flush_count(&ui); /* 记录 UI flush。 */
     set_playback_progress(0, total_frames); /* 进度从 0ms 开始。 */
@@ -1904,15 +1843,15 @@ static int run_ui_video(const char *path)
                                    (unsigned int)video_rect.h) < 0) /* 视频层在 UI 上方。 */
         goto out_ui;                /* 打开失败。 */
 
-    if (g2d_display_open_sized(&g2d, DEFAULT_WIDTH, DEFAULT_HEIGHT,
+    if (g2d_display_open_sized(&g2d, src_width, src_height,
                                (unsigned int)video_rect.w,
                                (unsigned int)video_rect.h) < 0) /* G2D 输出到视频窗口大小。 */
         goto out_video_disp;        /* 打开失败。 */
 
-    if (image_convert_open(&decoder, DEFAULT_WIDTH, DEFAULT_HEIGHT) < 0) /* 初始化 MJPG 解码器。 */
+    if (image_convert_open(&decoder, src_width, src_height) < 0)
         goto out_g2d;               /* 打开失败。 */
 
-    while (!g_stop) {               /* 持续播放直到文件结束或 Ctrl+C。 */
+    while (!g_stop && !storage_session_lost()) { /* 命令行 JPEG/裸流同样响应拔盘。 */
         const unsigned char *frame_data; /* 当前 JPEG 帧数据。 */
         size_t frame_size;          /* 当前 JPEG 帧长度。 */
         struct yuv_image yuv;       /* 解码后的 YUV 图像。 */
@@ -1944,10 +1883,7 @@ static int run_ui_video(const char *path)
         flush_now = t113_ui_lvgl_get_flush_count(&ui); /* 查询 UI 是否刷新。 */
         if (flush_now != last_flush) { /* 如果 UI 有变化。 */
             last_flush = flush_now; /* 更新计数。 */
-            disp_layer_display_show_argb8888(&ui_disp,
-                                             t113_ui_lvgl_get_dmabuf_fd(&ui),
-                                             t113_ui_lvgl_get_width(&ui),
-                                             t113_ui_lvgl_get_height(&ui));
+            t113_ui_lvgl_present(&ui, &ui_disp);
         }
 
         usleep(33333);              /* 第一版按约 30fps 播放。 */
@@ -1968,6 +1904,7 @@ out_video_disp:
     disp_layer_display_close(&video_disp); /* 关闭视频图层。 */
 out_ui:
     printf("ui video frames: %u\n", frames);
+    disp_layer_display_hide(&ui_disp);
     t113_ui_lvgl_close(&ui);        /* 关闭 UI。 */
 out_ui_disp:
     disp_layer_display_close(&ui_disp); /* 关闭 UI 图层。 */
@@ -1977,6 +1914,47 @@ out_file:
 }
 
 /* 默认播放模式：显示播放列表，用三个实体按键选择并播放媒体。 */
+/* 应用协调层：旧任务收尾完成后再确认新盘；监控模块完全不依赖此函数。 */
+static int sync_storage_ui(struct disp_layer_display *disp, struct t113_ui_lvgl *ui,
+                           struct record_preview *record, struct still_preview *still,
+                           struct media_list *list, size_t *selected, int *record_mode,
+                           uint64_t *generation, uint32_t *last_flush)
+{
+    struct storage_snapshot storage; /* 只使用锁内复制出来的一致快照。 */
+    storage_monitor_snapshot(&g_storage, &storage); /* 获取设备与挂载身份。 */
+    if (storage.generation == *generation && !storage_session_lost())
+        return 1; /* 没有变化，不重扫目录、不重开解码器。 */
+    if (*record_mode) { /* 原相机任务必须先退出，不能跨会话继续保存。 */
+        if (record->recording)
+            record_writer_abort(&record->sink); /* 通知写线程失败，不跨线程关闭 muxer。 */
+        record_preview_close(record); /* join 音频与写线程，然后关闭摄像头及预览。 */
+        *record_mode = 0; /* 换盘统一回到播放列表，不自动恢复录像。 */
+    }
+    still_preview_close(still); /* 关闭旧照片及其显示图层。 */
+    hide_video_overlay_layer(); /* 清除旧视频，保留 UI 层。 */
+    t113_ui_lvgl_set_audio_visualizer(false); /* 清除旧音频条。 */
+    t113_ui_lvgl_set_playing(false); /* 恢复未播放按钮。 */
+    t113_ui_lvgl_set_rec_led(0); /* 离开相机模式后关灯。 */
+    t113_ui_lvgl_set_screen_title("VEDIO PLAYER"); /* 只改文本，不改模板样式。 */
+    t113_ui_lvgl_set_progress(0, 100); /* 旧文件进度不带入新盘。 */
+    t113_ui_lvgl_set_fps(0); /* 清零旧帧率。 */
+    if (storage_monitor_adopt(&g_storage, storage.generation) < 0)
+        return 0; /* 清理期间再次插拔，下轮使用最新状态。 */
+    *generation = storage.generation; /* 记录应用已完成清理的会话。 */
+    snprintf(g_storage_root, sizeof(g_storage_root), "%s", storage.root); /* 缺盘为空，绝不回退到 flash。 */
+    *selected = 0; /* 新列表从第一项开始。 */
+    refresh_media_list_ui(list, selected); /* 扫描实际挂载目录，缺盘清空列表。 */
+    update_playback_selection_preview(disp, ui, still, list, *selected, last_flush); /* 容器视频首帧预览保持关闭。 */
+    if (!storage.state)
+        t113_ui_lvgl_set_video_message("USB NOT READY"); /* 提示无法播放或录制。 */
+    if (storage.state == STORAGE_READ_ONLY)
+        t113_ui_lvgl_set_usb_status("USB READ ONLY"); /* 允许播放，禁止录制。 */
+    submit_ui_force(disp, ui, last_flush); /* LVGL 只在主线程执行。 */
+    printf("usb state   : generation=%llu state=%d root=%s\n",
+           (unsigned long long)*generation, storage.state, USB_ROOT); /* 仅变化时记录日志。 */
+    return !storage_session_lost(); /* 扫描期间又拔盘时不处理旧按键。 */
+}
+
 static int run_player_mode(void)
 {
     struct disp_layer_display ui_disp; /* UI 背景图层。 */
@@ -1993,6 +1971,8 @@ static int run_player_mode(void)
     int video_rect_ready = 0;        /* 是否成功取得视频框区域。 */
     int input_ready = 0;             /* 输入设备是否打开成功。 */
     int record_mode = 0;             /* 当前是否处于录制模式占位状态。 */
+    int photo_mode = 0;              /* 长按 NEXT 切换，短按中键拍照。 */
+    uint64_t storage_generation = 0; /* 主线程最后完成收尾并确认的存储会话。 */
     int ret = -1;                    /* 默认失败。 */
 
     memset(&ui_disp, 0, sizeof(ui_disp)); /* 清空 UI 图层。 */
@@ -2025,10 +2005,7 @@ static int run_player_mode(void)
     t113_ui_lvgl_set_rec_led(0);    /* 播放模式下 REC 灯熄灭。 */
     t113_ui_lvgl_set_fps(0);        /* 启动时 FPS 清零。 */
 
-    if (disp_layer_display_show_argb8888(&ui_disp,
-                                         t113_ui_lvgl_get_dmabuf_fd(&ui),
-                                         t113_ui_lvgl_get_width(&ui),
-                                         t113_ui_lvgl_get_height(&ui)) < 0)
+    if (t113_ui_lvgl_present(&ui, &ui_disp) < 0)
         goto out_ui;                /* 首帧 UI 显示失败。 */
     last_flush = t113_ui_lvgl_get_flush_count(&ui); /* 记录首帧。 */
     update_playback_selection_preview(&ui_disp, &ui, &still_preview,
@@ -2045,6 +2022,9 @@ static int run_player_mode(void)
     while (!g_stop) {               /* 主事件循环。 */
         struct app_key_event event; /* 当前按键事件。 */
 
+        if (!sync_storage_ui(&ui_disp, &ui, &record_preview, &still_preview,
+                             &list, &selected, &record_mode, &storage_generation, &last_flush))
+            continue; /* 清理期间再次换盘：取新快照，暂不响应旧列表按键。 */
         if (input_ready && input_key_poll(&input, &event) > 0) { /* 有按键。 */
             if (!record_mode) {     /* 播放列表模式。 */
                 if (event.key == APP_KEY_NEXT &&
@@ -2070,14 +2050,16 @@ static int run_player_mode(void)
                         t113_ui_lvgl_set_playing(true);
                         t113_ui_lvgl_set_video_message("");
                         submit_ui_force(&ui_disp, &ui, &last_flush);
-                        if (item->type == MEDIA_TYPE_MKV ||
+                        if (item->type == MEDIA_TYPE_JPEG) {
+                            play_result = PLAYBACK_RESULT_END;
+                        } else if (item->type == MEDIA_TYPE_MKV ||
                             item->type == MEDIA_TYPE_AVI ||
                             item->type == MEDIA_TYPE_MP4) /* 容器文件：FFmpeg 解封装。 */
                             play_result = play_mkv_on_current_ui(&ui_disp, &ui,
                                                                  input_ready ? &input : NULL,
                                                                  item->path, &last_flush);
                         else if (item->type == MEDIA_TYPE_WAV) /* 音频文件：ALSA 播放。 */
-                            play_result = play_wav_on_current_ui(&ui_disp, &ui,
+                            play_result = play_ffmpeg_audio_on_current_ui(&ui_disp, &ui,
                                                                  input_ready ? &input : NULL,
                                                                  item->path, &last_flush);
                         else if (item->type == MEDIA_TYPE_AAC ||
@@ -2089,8 +2071,13 @@ static int run_player_mode(void)
                             play_result = play_mjpeg_on_current_ui(&ui_disp, &ui,
                                                                    input_ready ? &input : NULL,
                                                                    item->path, &last_flush);
+                        if (storage_session_lost()) continue; /* 先进入统一换盘收尾，不再渲染旧列表或旧照片。 */
                         hide_video_overlay_layer();
                         t113_ui_lvgl_set_playing(false);
+                        t113_ui_lvgl_set_fps(0);
+                        t113_ui_lvgl_set_progress(0, 100);
+                        if (play_result == PLAYBACK_RESULT_RECORD)
+                            goto enter_record_mode;
                         if (play_result == PLAYBACK_RESULT_NEXT && list.count > 0) {
                             selected = (selected + 1U) % list.count; /* 播放中切下一项。 */
                             t113_ui_lvgl_playlist_select((uint32_t)selected);
@@ -2100,6 +2087,10 @@ static int run_player_mode(void)
                         }
                         update_playback_selection_preview(&ui_disp, &ui, &still_preview,
                                                           &list, selected, &last_flush);
+                        if (play_result == PLAYBACK_RESULT_ERROR) {
+                            t113_ui_lvgl_set_video_message("PLAY ERROR");
+                            submit_ui_force(&ui_disp, &ui, &last_flush);
+                        }
                     } else {
                         still_preview_close(&still_preview);
                         hide_video_overlay_layer();
@@ -2109,7 +2100,14 @@ static int run_player_mode(void)
                     }
                 } else if (event.key == APP_KEY_BACK &&
                            event.action == APP_KEY_ACTION_LONG) {
+enter_record_mode:
+                    if (storage_session_lost() || !media_storage_ready(USB_ROOT, 1)) {
+                        t113_ui_lvgl_set_video_message("USB NOT READY");
+                        submit_ui_force(&ui_disp, &ui, &last_flush);
+                        continue;
+                    }
                     record_mode = 1; /* 进入录制模式占位状态。 */
+                    photo_mode = 0;
                     record_selected = 0; /* 默认选择 record1。 */
                     still_preview_close(&still_preview); /* 进入录制模式前关闭静态预览层。 */
                     hide_video_overlay_layer(); /* 先清掉播放模式可能留下的视频图层。 */
@@ -2139,6 +2137,7 @@ static int run_player_mode(void)
             } else {                /* 录制模式占位状态。 */
                 if (event.key == APP_KEY_BACK &&
                     event.action == APP_KEY_ACTION_LONG) {
+                    int save_result = record_preview_stop_record(&record_preview);
                     record_mode = 0; /* 返回播放列表。 */
                     record_preview_close(&record_preview);
                     hide_video_overlay_layer();
@@ -2146,12 +2145,22 @@ static int run_player_mode(void)
                     t113_ui_lvgl_set_rec_led(0); /* 离开录制模式后 REC 灯熄灭。 */
                     t113_ui_lvgl_set_fps(0);     /* 返回播放列表时清空 FPS。 */
                     t113_ui_lvgl_set_audio_visualizer(false);
-                    sync();        /* 等 U 盘目录项和 AVI trailer 尽量落盘。 */
                     usleep(300000); /* 避免刚写完文件就立刻解封装/扫描。 */
                     refresh_media_list_ui(&list, &selected);
                     t113_ui_lvgl_set_playing(false);
                     update_playback_selection_preview(&ui_disp, &ui, &still_preview,
                                                       &list, selected, &last_flush);
+                    if (save_result < 0) {
+                        t113_ui_lvgl_set_video_message("SAVE ERROR");
+                        submit_ui_force(&ui_disp, &ui, &last_flush);
+                    }
+                } else if (event.key == APP_KEY_NEXT && event.action == APP_KEY_ACTION_LONG) {
+                    if (!record_preview.recording) {
+                        photo_mode = !photo_mode;
+                        t113_ui_lvgl_set_title(g_record_names[record_selected], photo_mode ? "Photo" : "Video");
+                        printf("camera mode : %s\n", photo_mode ? "photo" : "video");
+                        submit_ui_force(&ui_disp, &ui, &last_flush);
+                    }
                 } else if (event.key == APP_KEY_NEXT &&
                            event.action == APP_KEY_ACTION_SHORT) {
                     if (record_preview.recording) {
@@ -2184,6 +2193,9 @@ static int run_player_mode(void)
                            event.action == APP_KEY_ACTION_SHORT) {
                     if (!record_preview.opened) {
                         t113_ui_lvgl_set_video_message("CAMERA ERROR");
+                    } else if (photo_mode && !record_preview.recording) {
+                        int saved = record_preview_photo(&record_preview, g_record_names[record_selected]);
+                        t113_ui_lvgl_set_title(g_record_names[record_selected], saved == 0 ? "Photo saved" : "Save error");
                     } else if (!record_preview.recording) {
                         if (record_preview_start_record(&record_preview,
                                                         g_record_names[record_selected]) == 0) {
@@ -2197,9 +2209,8 @@ static int run_player_mode(void)
                             t113_ui_lvgl_set_video_message("REC ERROR");
                         }
                     } else {
-                        unsigned int saved_frames = record_preview.writer.frames;
-
                         if (record_preview_stop_record(&record_preview) == 0) {
+                            unsigned int saved_frames = record_preview.writer.frames;
                             char message[64];
 
                             snprintf(message, sizeof(message), "SAVED %u FRAMES",
@@ -2223,7 +2234,12 @@ static int run_player_mode(void)
 
         if (record_mode && record_preview.opened) { /* 录制模式下持续预览摄像头。 */
             if (record_preview_step(&record_preview) < 0) {
+                if (g_stop)
+                    break;          /* Ctrl+C 打断 select 属于正常停止，继续写尾。 */
+                if (record_preview.recording)
+                    record_writer_abort(&record_preview.sink);
                 record_preview_close(&record_preview);
+                t113_ui_lvgl_set_playing(false);
                 t113_ui_lvgl_set_video_message("CAMERA ERROR");
                 t113_ui_lvgl_set_rec_led(255);
                 submit_ui_force(&ui_disp, &ui, &last_flush);
@@ -2243,10 +2259,13 @@ static int run_player_mode(void)
 
 out_input:
     still_preview_close(&still_preview);
+    if (record_preview_stop_record(&record_preview) < 0)
+        ret = -1;                   /* 退出时保存失败也必须反映到进程退出码。 */
     record_preview_close(&record_preview);
     if (input_ready)                /* 输入打开过就关闭。 */
         input_key_close(&input);
 out_ui:
+    disp_layer_display_hide(&ui_disp);
     t113_ui_lvgl_close(&ui);        /* 释放 LVGL/ION 资源。 */
 out_disp:
     disp_layer_display_close(&ui_disp); /* 关闭 UI 图层。 */
@@ -2337,119 +2356,6 @@ static uint8_t record_breath_brightness(void)
     if (phase >= 600U)              /* 后半周期从亮变暗。 */
         phase = 1199U - phase;      /* 镜像成 0~599。 */
     return (uint8_t)(40U + (phase * 215U) / 599U); /* 亮度范围 40~255。 */
-}
-
-/* 保存线程：不断从录制队列取 MJPG 帧并写入 U 盘。 */
-static void *record_thread_main(void *arg)
-{
-    struct record_worker *worker = arg; /* 转回保存线程上下文。 */
-    struct frame_packet *packet;    /* 当前要保存的帧。 */
-
-    worker->ret = 0;                /* 默认线程成功。 */
-    while ((packet = frame_queue_pop(worker->queue)) != NULL) { /* 直到队列停止且取空。 */
-        if (ffmpeg_mjpeg_muxer_write(worker->writer, packet->data, packet->size) < 0) { /* 写 U 盘。 */
-            worker->ret = -1;       /* 记录写入失败。 */
-            g_stop = 1;             /* 通知其他线程退出。 */
-            frame_packet_release(packet); /* 释放当前帧引用。 */
-            break;                  /* 退出线程循环。 */
-        }
-        frame_packet_release(packet); /* 保存完成后释放帧引用。 */
-    }
-    return NULL;                    /* pthread 线程返回。 */
-}
-
-/* 预览线程：不断从预览队列取 MJPG 帧，解码后显示到屏幕。 */
-static void *preview_thread_main(void *arg)
-{
-    struct preview_worker *worker = arg; /* 转回预览线程上下文。 */
-    struct frame_packet *packet;    /* 当前要预览的帧。 */
-
-    worker->ret = 0;                /* 默认线程成功。 */
-    while ((packet = frame_queue_pop(worker->queue)) != NULL) { /* 直到队列停止且取空。 */
-        struct yuv_image yuv;       /* CedarC 解码后的 YUV 图像。 */
-
-        memset(&yuv, 0, sizeof(yuv)); /* 清空 YUV 结构。 */
-        if (image_convert_decode_mjpeg(worker->decoder, packet->data,
-                                       packet->size, &yuv) < 0) { /* CedarC 硬解 MJPG。 */
-            worker->ret = -1;       /* 记录解码失败。 */
-            g_stop = 1;             /* 通知其他线程退出。 */
-            frame_packet_release(packet); /* 释放当前帧引用。 */
-            break;                  /* 退出线程循环。 */
-        }
-
-        if (g2d_display_stretch_yuv_to_dmabuf(worker->g2d, &yuv) < 0) { /* G2D 输出到 dmabuf。 */
-            image_convert_free_yuv(&yuv); /* 释放解码图像。 */
-            worker->ret = -1;       /* 记录显示失败。 */
-            g_stop = 1;             /* 通知其他线程退出。 */
-            frame_packet_release(packet); /* 释放当前帧引用。 */
-            break;                  /* 退出线程循环。 */
-        }
-
-        if (disp_layer_display_show_argb8888(worker->disp,
-                                             g2d_display_get_dst_fd(worker->g2d),
-                                             g2d_display_get_dst_width(worker->g2d),
-                                             g2d_display_get_dst_height(worker->g2d)) < 0) { /* disp layer 显示。 */
-            image_convert_free_yuv(&yuv); /* 释放解码图像。 */
-            worker->ret = -1;       /* 记录显示失败。 */
-            g_stop = 1;             /* 通知其他线程退出。 */
-            frame_packet_release(packet); /* 释放当前帧引用。 */
-            break;                  /* 退出线程循环。 */
-        }
-
-        image_convert_free_yuv(&yuv); /* 归还 CedarC 图像或释放回退缓冲。 */
-        frame_packet_release(packet); /* 释放 MJPG 帧引用。 */
-        worker->frames++;           /* 统计成功显示帧数。 */
-    }
-    return NULL;                    /* pthread 线程返回。 */
-}
-
-/* 采集线程：从摄像头取 MJPG 帧，引用原始 mmap buffer 后送到保存队列和预览队列。 */
-static void *capture_thread_main(void *arg)
-{
-    struct capture_worker *worker = arg; /* 转回采集线程上下文。 */
-    struct timespec start;          /* 录制开始时间。 */
-
-    worker->ret = -1;               /* 默认采集失败，完整结束后改为 0。 */
-
-    clock_gettime(CLOCK_MONOTONIC, &start); /* 记录开始时间。 */
-    while (!g_stop && elapsed_seconds_since(&start) < worker->seconds) { /* 录制时间内循环。 */
-        struct frame_packet *packet;/* 给保存/预览线程共享的一帧 MJPG。 */
-        struct video_frame frame;   /* V4L2 当前 mmap 帧。 */
-
-        if (video_capture_get_frame(worker->cap, &frame) < 0) /* 从摄像头取一帧。 */
-            goto out_stream;        /* 采集失败则退出。 */
-
-        packet = frame_packet_from_v4l2(worker->cap, &frame); /* 引用 V4L2 buffer，不复制 MJPG。 */
-        if (packet == NULL) {       /* MJPG 副本分配失败。 */
-            video_capture_put_frame(worker->cap, &frame); /* packet 创建失败时立即归还。 */
-            goto out_stream;        /* 退出采集。 */
-        }
-
-        frame_packet_add_ref(packet); /* 保存队列持有一个引用。 */
-        if (frame_queue_push_wait(worker->record_queue, packet) < 0) { /* 入保存队列。 */
-            frame_packet_release(packet); /* 入队失败则释放保存队列引用。 */
-            frame_packet_release(packet); /* 释放采集线程本地引用。 */
-            break;                  /* 停止采集循环。 */
-        }
-
-        frame_packet_add_ref(packet); /* 预览队列持有一个引用。 */
-        if (frame_queue_push_drop_oldest(worker->preview_queue, packet,
-                                         &worker->preview_dropped) < 0) { /* 入预览队列。 */
-            frame_packet_release(packet); /* 入队失败则释放预览队列引用。 */
-            frame_packet_release(packet); /* 释放采集线程本地引用。 */
-            break;                  /* 停止采集循环。 */
-        }
-
-        frame_packet_release(packet); /* 两个队列已持有引用，采集线程释放本地引用。 */
-        worker->captured++;         /* 统计采集帧数。 */
-    }
-
-    worker->ret = 0;                /* 到时或 Ctrl+C 视为正常结束。 */
-
-out_stream:
-    frame_queue_stop(worker->record_queue);  /* 通知保存线程收尾。 */
-    frame_queue_stop(worker->preview_queue); /* 通知预览线程收尾。 */
-    return NULL;                    /* pthread 线程返回。 */
 }
 
 /* 实时预览：MJPG -> CedarC YUV -> G2D -> /dev/disp layer，直到 Ctrl+C。 */
@@ -2546,168 +2452,77 @@ out_print_preview:
     return ret;                     /* 返回执行结果。 */
 }
 
-/* 录制：同一帧 MJPG 同时保存到 U 盘，并实时预览到屏幕。 */
+/* 定时录制复用正式 UI 的音视频链路，避免 CLI 与主工程行为分叉。 */
 static int run_record(int seconds)
 {
-    struct ffmpeg_mjpeg_muxer writer; /* AVI 封装器。 */
-    struct video_capture cap;        /* V4L2 摄像头上下文，队列消费完后才能关闭。 */
-    struct disp_layer_display disp;  /* /dev/disp layer 显示上下文。 */
-    struct g2d_display g2d;          /* G2D 显示上下文。 */
-    struct cedar_decoder decoder;    /* CedarC 持久化解码器上下文。 */
-    struct frame_queue record_queue; /* 保存线程使用的帧队列。 */
-    struct frame_queue preview_queue;/* 预览线程使用的帧队列。 */
-    struct record_worker record_worker; /* 保存线程参数。 */
-    struct preview_worker preview_worker; /* 预览线程参数。 */
-    struct capture_worker capture_worker; /* 采集线程参数。 */
-    pthread_t record_thread;         /* 保存线程 ID。 */
-    pthread_t preview_thread;        /* 预览线程 ID。 */
-    pthread_t capture_thread;        /* 采集线程 ID。 */
-    char path[512];                  /* 输出文件路径。 */
-    int all_threads_started = 0;     /* 三个线程是否全部启动成功。 */
-    int record_started = 0;          /* 保存线程是否成功启动。 */
-    int preview_started = 0;         /* 预览线程是否成功启动。 */
-    int capture_started = 0;         /* 采集线程是否成功启动。 */
-    int record_queue_ready = 0;      /* 保存队列是否初始化。 */
-    int preview_queue_ready = 0;     /* 预览队列是否初始化。 */
-    int capture_opened = 0;          /* 摄像头是否已经打开。 */
-    int capture_streaming = 0;       /* 摄像头是否已经开始 stream。 */
-    int ret = -1;                    /* 默认返回失败，正常结束时改为 0。 */
+    struct disp_layer_display ui_disp = {0};
+    struct t113_ui_lvgl ui = {0};
+    struct record_preview preview = {0};
+    struct t113_ui_rect rect;
+    uint32_t last_flush = 0;
+    int64_t start;
+    int ret = -1;
 
-    memset(&writer, 0, sizeof(writer)); /* 清空写入器上下文。 */
-    memset(&cap, 0, sizeof(cap));    /* 清空摄像头上下文。 */
-    memset(&disp, 0, sizeof(disp));  /* 清空 disp layer 上下文。 */
-    memset(&g2d, 0, sizeof(g2d));    /* 清空 G2D 上下文。 */
-    memset(&decoder, 0, sizeof(decoder)); /* 清空 CedarC 上下文。 */
-    memset(&record_worker, 0, sizeof(record_worker)); /* 清空保存线程参数。 */
-    memset(&preview_worker, 0, sizeof(preview_worker)); /* 清空预览线程参数。 */
-    memset(&capture_worker, 0, sizeof(capture_worker)); /* 清空采集线程参数。 */
-    record_worker.ret = -1;         /* 线程未启动前按失败处理。 */
-    preview_worker.ret = -1;        /* 线程未启动前按失败处理。 */
-    capture_worker.ret = -1;        /* 线程未启动前按失败处理。 */
-    cap.fd = -1;                    /* 标记摄像头尚未打开。 */
-    g2d.fd = -1;                    /* 标记 G2D 设备尚未打开。 */
-
-    kill_lvgl_demo();               /* 录制带预览时也要停掉开机 LVGL demo。 */
-
-    if (ffmpeg_mjpeg_muxer_open(&writer, USB_ROOT,
-                                DEFAULT_WIDTH, DEFAULT_HEIGHT, PLAYER_FPS,
-                                path, sizeof(path)) < 0) /* 打开输出文件。 */
-        return -1;                  /* U 盘不可用或文件打不开。 */
-
-    if (disp_layer_display_open(&disp, 800, 480) < 0) /* 打开 /dev/disp layer。 */
-        goto out_writer;            /* 失败则关闭输出文件。 */
-
-    if (g2d_display_open(&g2d, DEFAULT_WIDTH, DEFAULT_HEIGHT) < 0) /* 打开 G2D。 */
-        goto out_disp;              /* 失败则释放 disp layer。 */
-
-    if (image_convert_open(&decoder, DEFAULT_WIDTH, DEFAULT_HEIGHT) < 0) /* 打开 CedarC。 */
-        goto out_g2d;               /* 失败则释放 G2D。 */
-
-    if (video_capture_open(&cap, DEFAULT_DEVICE, DEFAULT_WIDTH, DEFAULT_HEIGHT,
-                           V4L2_PIX_FMT_MJPEG) < 0) /* 打开 UVC 摄像头。 */
-        goto out_decoder;           /* 失败则释放 CedarC。 */
-    capture_opened = 1;             /* 标记摄像头已打开。 */
-
-    if (video_capture_start(&cap) < 0) /* 启动 V4L2 stream。 */
-        goto out_capture;           /* 失败则关闭摄像头。 */
-    capture_streaming = 1;          /* 标记 stream 已启动。 */
-
-    if (frame_queue_init(&record_queue, RECORD_QUEUE_CAPACITY, &g_stop) < 0) /* 初始化保存队列。 */
-        goto out_capture;           /* 失败则关闭摄像头。 */
-    record_queue_ready = 1;         /* 标记保存队列可销毁。 */
-
-    if (frame_queue_init(&preview_queue, PREVIEW_QUEUE_CAPACITY, &g_stop) < 0) /* 初始化预览队列。 */
-        goto out_queues;            /* 失败则销毁保存队列。 */
-    preview_queue_ready = 1;        /* 标记预览队列可销毁。 */
-
-    record_worker.queue = &record_queue; /* 保存线程消费保存队列。 */
-    record_worker.writer = &writer; /* 保存线程写入同一个 writer。 */
-
-    preview_worker.queue = &preview_queue; /* 预览线程消费预览队列。 */
-    preview_worker.disp = &disp;    /* 预览线程使用 /dev/disp layer。 */
-    preview_worker.g2d = &g2d;      /* 预览线程使用 G2D。 */
-    preview_worker.decoder = &decoder; /* 预览线程使用 CedarC。 */
-
-    capture_worker.cap = &cap;      /* 采集线程使用已打开的摄像头。 */
-    capture_worker.record_queue = &record_queue; /* 采集线程投递保存队列。 */
-    capture_worker.preview_queue = &preview_queue; /* 采集线程投递预览队列。 */
-    capture_worker.seconds = seconds; /* 设置录制秒数。 */
-
-    printf("record      : %d sec -> %s\n", seconds, path); /* 打印录制信息。 */
-    printf("preview     : enabled while recording\n"); /* 提示录制时同步预览。 */
-
-    if (pthread_create(&record_thread, NULL, record_thread_main, &record_worker) != 0) /* 启动保存线程。 */
-        goto out_queues;            /* 启动失败则清理队列。 */
-    record_started = 1;             /* 标记保存线程已启动。 */
-
-    if (pthread_create(&preview_thread, NULL, preview_thread_main, &preview_worker) != 0) /* 启动预览线程。 */
-        goto out_threads;           /* 启动失败则停止已启动线程。 */
-    preview_started = 1;            /* 标记预览线程已启动。 */
-
-    if (pthread_create(&capture_thread, NULL, capture_thread_main, &capture_worker) != 0) /* 启动采集线程。 */
-        goto out_threads;           /* 启动失败则停止已启动线程。 */
-    capture_started = 1;            /* 标记采集线程已启动。 */
-    all_threads_started = 1;        /* 三个线程已经全部启动成功。 */
-
-    if (capture_started) {          /* 如果采集线程已启动。 */
-        pthread_join(capture_thread, NULL); /* 等采集线程录制到时或 Ctrl+C。 */
-        capture_started = 0;        /* 标记已经 join。 */
+    preview.cap.fd = preview.g2d.fd = -1;
+    kill_lvgl_demo();
+    hide_video_overlay_layer();
+    if (disp_layer_display_open_ex(&ui_disp, 800, 480, 1, 0, 10, 0, 0, 800, 480) < 0)
+        return -1;
+    if (t113_ui_lvgl_open(&ui, 800, 480) < 0)
+        goto out_disp;
+    t113_ui_lvgl_set_screen_title("Camera");
+    if (!t113_ui_lvgl_get_video_rect(&rect) ||
+        submit_ui_force(&ui_disp, &ui, &last_flush) < 0 ||
+        record_preview_open(&preview, &rect) < 0 ||
+        record_preview_step(&preview) < 0 || /* 先预热硬解，再启动麦克风，避免首帧初始化造成 overrun。 */
+        record_preview_start_record(&preview, "video") < 0)
+        goto out_preview;
+    start = media_monotonic_ms();
+    t113_ui_lvgl_set_playing(true);
+    while (!g_stop && !storage_session_lost() && media_monotonic_ms() - start < seconds * 1000LL) { /* 定时录制按单调时间退出；拔盘和 Ctrl+C 同样触发收尾。 */
+        if (record_preview_step(&preview) < 0) {
+            if (g_stop)
+                break;
+            record_writer_abort(&preview.sink); /* 预览或显示异常使录制失败，不能将部分文件当完整录像。 */
+            goto out_preview;
+        }
+        t113_ui_lvgl_set_rec_led(record_breath_brightness());
+        if (submit_ui_if_dirty(&ui_disp, &ui, &last_flush) < 0) {
+            record_writer_abort(&preview.sink); /* 预览或显示异常使录制失败，不能将部分文件当完整录像。 */
+            goto out_preview;
+        }
     }
-
-out_threads:
-    frame_queue_stop(&record_queue);/* 确保保存线程能退出。 */
-    frame_queue_stop(&preview_queue);/* 确保预览线程能退出。 */
-    if (capture_started)            /* 如果采集线程还没 join。 */
-        pthread_join(capture_thread, NULL); /* 等采集线程退出。 */
-    if (record_started)             /* 如果保存线程已启动。 */
-        pthread_join(record_thread, NULL); /* 等保存线程写完队列。 */
-    if (preview_started)            /* 如果预览线程已启动。 */
-        pthread_join(preview_thread, NULL); /* 等预览线程显示完队列。 */
-
-    if (all_threads_started &&
-        capture_worker.ret == 0 && record_worker.ret == 0 && preview_worker.ret == 0) /* 三个线程都正常。 */
-        ret = 0;                    /* 整体录制成功。 */
-
-out_queues:
-    if (preview_queue_ready)        /* 如果预览队列初始化过。 */
-        frame_queue_destroy(&preview_queue); /* 销毁预览队列。 */
-    if (record_queue_ready)         /* 如果保存队列初始化过。 */
-        frame_queue_destroy(&record_queue);  /* 销毁保存队列。 */
-out_capture:
-    if (capture_streaming)          /* 队列消费完以后再停流。 */
-        video_capture_stop(&cap);   /* 停止 V4L2 stream。 */
-    if (capture_opened)             /* 如果摄像头已经打开。 */
-        video_capture_close(&cap);  /* 释放 mmap 缓冲并关闭摄像头。 */
-out_decoder:
-    disp_layer_display_close(&disp);/* 先关闭 disp layer。 */
-    g2d_display_close(&g2d);        /* 再关闭 G2D。 */
-    image_convert_close(&decoder);  /* 最后关闭 CedarC。 */
-    goto out_writer;
-out_g2d:
-    disp_layer_display_close(&disp);/* 确保 disp layer 先关闭。 */
-    g2d_display_close(&g2d);        /* 关闭 G2D。 */
-    goto out_writer;
+    if (record_preview_stop_record(&preview) == 0) {
+        printf("saved       : %s\nRESULT      : PASS\n", preview.record_path);
+        ret = 0;
+    }
+out_preview:
+    if (ret < 0 && preview.recording)
+        record_writer_abort(&preview.sink); /* 预览或显示异常使录制失败，不能将部分文件当完整录像。 */
+    record_preview_close(&preview);
+    hide_video_overlay_layer();
+    disp_layer_display_hide(&ui_disp);
+    t113_ui_lvgl_close(&ui);
 out_disp:
-    disp_layer_display_close(&disp);/* 关闭 disp layer。 */
-out_writer:
-    ffmpeg_mjpeg_muxer_close(&writer); /* 关闭文件并 sync 到 U 盘。 */
-
-    if (ret == 0) {                 /* 如果录制成功。 */
-        printf("saved       : %s\n", path); /* 打印保存路径。 */
-        printf("frames      : %u\n", writer.frames); /* 打印写入帧数。 */
-        printf("captured    : %u\n", capture_worker.captured); /* 打印采集帧数。 */
-        printf("previewed   : %u\n", preview_worker.frames); /* 打印预览帧数。 */
-        printf("preview drop: %u\n", capture_worker.preview_dropped); /* 打印预览丢帧数。 */
-        printf("bytes       : %lu\n", (unsigned long)writer.bytes); /* 打印写入大小。 */
-        printf("RESULT      : PASS\n"); /* 打印成功标记。 */
-    }
-    return ret;                     /* 返回执行结果。 */
+    disp_layer_display_close(&ui_disp);
+    return ret;
 }
 
 /* 程序入口：无参数预览，一个 1~59 参数录制。 */
-int main(int argc, char **argv)
+static int app_main(int argc, char **argv)
 {
     int seconds;                    /* 录制秒数。 */
+    int lock_fd;
+    setvbuf(stdout, NULL, _IOLBF, 0); /* SSH 后台日志也逐行输出，便于排查。 */
+
+    /* 同时启动两套显示/解码器会争用硬件；锁随进程退出自动释放。 */
+    lock_fd = open("/tmp/t113_camera.lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600); /* 进程锁避免多个实例同时控制显示图层和摄像头。 */
+    if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) < 0) { /* 非阻塞独占锁失败直接退出，不争用同一硬件。 */
+        fprintf(stderr, "T113Camera already running or lock unavailable\n");
+        if (lock_fd >= 0)
+            close(lock_fd);
+        return 1;
+    }
 
     signal(SIGINT, on_signal);      /* 注册 Ctrl+C 信号处理。 */
     signal(SIGTERM, on_signal);     /* 注册终止信号处理。 */
@@ -2745,4 +2560,22 @@ int main(int argc, char **argv)
 
     print_usage(argv[0]);           /* 其他参数个数都非法。 */
     return 1;                       /* 返回失败。 */
+}
+
+/* 资源入口只管理存储线程；应用逻辑继续由 app_main 分派。 */
+int main(int argc, char **argv)
+{
+    int ret, seconds; struct storage_snapshot storage; /* 退出码和启动挂载快照。 */
+    g_storage_enabled = argc == 1 || (argc == 2 && parse_record_seconds(argv[1], &seconds) == 0) ||
+                        (argc == 3 && !strncmp(argv[2], "/mnt/usb/", 9)); /* 非 U 盘独立显示不受热插拔影响。 */
+    if (g_storage_enabled) { /* 启动一次，覆盖播放内部循环和录制后台写入。 */
+        if (storage_monitor_start(&g_storage, NULL, NULL) < 0) return 1; /* 监控失败时拒绝运行存储任务。 */
+        storage_monitor_snapshot(&g_storage, &storage); /* 取真实挂载路径，不假设 sda。 */
+        snprintf(g_storage_root, sizeof(g_storage_root), "%s", storage.root); /* 无盘保持为空。 */
+    }
+    ret = app_main(argc, argv); /* 所有原命令返回路径集中经过资源收尾。 */
+    if (g_storage_enabled) { /* 所有媒体线程已 join，取消标志不会再被读取。 */
+        storage_bind_task(NULL); storage_monitor_close(&g_storage); /* 解绑后 join 监控，再销毁锁。 */
+    }
+    return ret; /* 保留原有命令成功/失败语义。 */
 }

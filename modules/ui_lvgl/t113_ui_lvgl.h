@@ -12,12 +12,19 @@ struct t113_ui_rect {
     int w;
     int h;
 };
+struct disp_layer_display;
+struct t113_ui_lvgl;
+int t113_ui_lvgl_present(struct t113_ui_lvgl *ui, struct disp_layer_display *disp);
 
 /* LVGL 渲染到 ION/dmabuf 的运行上下文。 */
 struct t113_ui_lvgl {
     struct SunxiMemOpsS *memops;
     void *virt;
     int dmabuf_fd;
+    void *scan_virt[2];             /* CPU staging is never scanned by the LCD. */
+    int scan_fd[2];
+    unsigned int scan_back;
+    int present_failed;            /* Never reuse a possibly scanning buffer after a failed latch. */
     uint32_t width;
     uint32_t height;
     uint32_t line_length;
@@ -74,7 +81,7 @@ void t113_ui_lvgl_playlist_select(uint32_t index);
 bool t113_ui_lvgl_get_video_rect(struct t113_ui_rect *rect);
 
 /* 获取 LVGL 当前渲染出的 ARGB8888 dmabuf fd。 */
-int t113_ui_lvgl_get_dmabuf_fd(const struct t113_ui_lvgl *ui);
+int t113_ui_lvgl_get_dmabuf_fd(struct t113_ui_lvgl *ui);
 
 /* 获取 dmabuf 宽度。 */
 uint32_t t113_ui_lvgl_get_width(const struct t113_ui_lvgl *ui);

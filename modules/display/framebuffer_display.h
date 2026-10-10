@@ -10,7 +10,7 @@ struct framebuffer_display {
     unsigned int virtual_height;    /* 虚拟高度，可能是 height 的 2 倍。 */
     unsigned int bpp;               /* 每像素 bit 数。 */
     unsigned int line_length;       /* 每行真实字节数。 */
-    unsigned long phys_addr;        /* framebuffer 显存物理地址，给 G2D 使用。 */
+    unsigned long phys_addr;        /* 驱动报告的显存物理地址；此回退实现使用 mmap CPU 写入。 */
     size_t map_size;                /* mmap 的显存大小。 */
     unsigned char *mem;             /* mmap 后的显存首地址。 */
 };
